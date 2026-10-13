@@ -1164,6 +1164,7 @@ class ODEFlowApp(QMainWindow):
         self.fz_input = QLineEdit()
         self.fx_input.setPlaceholderText("e.g. x^2 - y")
         self.fy_input.setPlaceholderText("e.g. x + y^2")
+        self._active_formula_editor = self.fx_input
         for editor in (self.fx_input, self.fy_input, self.fz_input):
             self._formula_history[editor] = {"undo": [], "redo": [], "last": editor.text()}
             editor.installEventFilter(self)
@@ -1498,6 +1499,8 @@ class ODEFlowApp(QMainWindow):
         self._remember_custom_equations()
 
     def eventFilter(self, watched, event):
+        if watched in self._formula_history and event.type() == QEvent.Type.FocusIn:
+            self._active_formula_editor = watched
         if watched in self._formula_history and event.type() == QEvent.Type.KeyPress:
             modifiers = event.modifiers()
             is_control = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
@@ -1540,13 +1543,24 @@ class ODEFlowApp(QMainWindow):
         self.apply_model()
 
     def insert_symbol(self, value):
-        widget = QApplication.focusWidget()
-        if widget not in (self.fx_input, self.fy_input, self.fz_input):
+        focused = QApplication.focusWidget()
+        if focused in (self.fx_input, self.fy_input, self.fz_input):
+            self._active_formula_editor = focused
+        widget = self._active_formula_editor
+        if self._dimension == "2D" and widget is self.fz_input:
             widget = self.fx_input
-        pos = widget.cursorPosition()
+            self._active_formula_editor = widget
         text = widget.text()
-        widget.setText(text[:pos] + value + text[pos:])
-        widget.setCursorPosition(min(len(format_formula_input(text[:pos] + value)), len(widget.text())))
+        selection_start = widget.selectionStart()
+        if selection_start >= 0:
+            start = selection_start
+            end = start + len(widget.selectedText())
+        else:
+            start = end = widget.cursorPosition()
+        inserted = text[:start] + value + text[end:]
+        widget.setText(inserted)
+        cursor = len(format_formula_input(text[:start] + value))
+        widget.setCursorPosition(min(cursor, len(widget.text())))
         widget.setFocus()
 
     def read_model(self):
