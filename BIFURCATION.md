@@ -15,8 +15,11 @@ existing behavior. Existing experiment files do not include this tab's settings.
    excluded from this first classical bifurcation analysis; the original phase
    portrait's absolute-value support is unaffected.
 2. Set the μ and x ranges. Analyze draws `f = 0`, an optional `f_x = 0`
-   locus, and the isolated intersections. Zoom changes only the displayed
-   region; change the range controls to search another region.
+   locus, and the isolated intersections. Manual zoom synchronizes the range
+   controls and analyzes the visible region after a short pause. Views within
+   completed or pending coverage reuse that search; expansion searches the union
+   of the previous coverage and the new view. New results preserve the zoom.
+   Reset view returns to the last manually entered range.
 3. Blue solid branches are attracting; red dashed branches are repelling.
    Orange marks semistable or inconclusive branches. Orange points mark
    nonhyperbolic candidates. A nonhyperbolic point need not be a bifurcation.

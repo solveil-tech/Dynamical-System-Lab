@@ -38,6 +38,11 @@ class BifurcationPanel(QWidget):
         self.result = self.trace_result = self.analysis_key = self.trace_key = None
         self.dark, self.initialized = False, False
         self._press = None
+        self._drawing = False
+        self.view_debounce = QTimer(self)
+        self.view_debounce.setSingleShot(True)
+        self.view_debounce.setInterval(300)
+        self.view_debounce.timeout.connect(self._analyze_view)
         self.analysis = AnalysisProcess(self, timeout_ms=20000)
         self.analysis.completed.connect(self._complete)
         self.analysis.failed.connect(self._failed)
@@ -73,6 +78,7 @@ class BifurcationPanel(QWidget):
             grid.addWidget(QLabel(label), 2+i//2, 3*(i%2))
             grid.addWidget(spin, 2+i//2, 3*(i%2)+1, 1, 2)
             spin.valueChanged.connect(self._changed)
+        self._home_bounds = tuple(spin.value() for spin in self.bounds)
         layout.addWidget(box)
         box = QGroupBox("Parameter sweep (click the diagram to select μ₀, x₀)")
         grid = QGridLayout(box)
@@ -108,7 +114,7 @@ class BifurcationPanel(QWidget):
         row.addWidget(self.show_derivative)
         row.addStretch()
         for label, callback in (("+", lambda: self.zoom(.8)), ("−", lambda: self.zoom(1.25)),
-                                ("Reset view", lambda: self.draw(reset=True)), ("Export PNG…", self.export_png)):
+                                ("Reset view", self.reset_view), ("Export PNG…", self.export_png)):
             button = QPushButton(label)
             button.clicked.connect(callback)
             row.addWidget(button)
@@ -169,6 +175,13 @@ class BifurcationPanel(QWidget):
         self._changed()
 
     def _changed(self, *_args):
+        self.view_debounce.stop()
+        if self.sender() in self.bounds:
+            self._home_bounds = tuple(spin.value() for spin in self.bounds)
+            self.draw(reset=True)
+            if self.initialized:
+                self.debounce.start()
+            return
         self.analysis_key = self.trace_key = None
         self.analysis.cancel()
         self.tracer.cancel()
@@ -192,14 +205,29 @@ class BifurcationPanel(QWidget):
         except ValueError as exc:
             self.status.setText(str(exc))
             return
-        key = (data["formula"], data["bounds"])
-        if key == self.analysis_key:
+        formula, requested = data["formula"], data["bounds"]
+        cached = self.result if self.result and self.result["formula"] == formula else None
+        pending = self.analysis_key if self.analysis_key and self.analysis_key[0] == formula else None
+        if cached and self._contains(cached["bounds"], requested):
+            self._info()
+            self.draw()
             return
+        if pending and self._contains(pending[1], requested):
+            return
+        # Keep the union of previous and newly visible coverage. Shrinking the
+        # view never invalidates a completed or still-running larger search.
+        bounds = requested
+        for covered in ([cached["bounds"]] if cached else []) + ([pending[1]] if pending else []):
+            bounds = (min(bounds[0], covered[0]), max(bounds[1], covered[1]),
+                      min(bounds[2], covered[2]), max(bounds[3], covered[3]))
+        data["bounds"] = bounds
+        key = (formula, bounds)
         self.analysis_key = key
-        self.trace_key = None
-        self.tracer.cancel()
-        self.result = self.trace_result = None
-        self.info.set_rows(["Computing equilibrium branches and critical points…"], self.fg)
+        if cached is None:
+            self.trace_key = None
+            self.tracer.cancel()
+            self.result = self.trace_result = None
+            self.info.set_rows(["Computing equilibrium branches and critical points…"], self.fg)
         self.status.setText("Analyzing f = 0 and fₓ = 0…")
         self.analysis.submit(key, data, "bifurcation")
 
@@ -213,7 +241,40 @@ class BifurcationPanel(QWidget):
         self.result = result
         self.status.setText("Ready. Click inside the diagram to trace a parameter sweep.")
         self._info()
+        self.draw()
+
+    @staticmethod
+    def _contains(outer, inner):
+        return (inner[0] >= outer[0]-1e-9 and inner[1] <= outer[1]+1e-9
+                and inner[2] >= outer[2]-1e-9 and inner[3] <= outer[3]+1e-9)
+
+    def _view_changed(self, _axes):
+        if not self._drawing:
+            self.view_debounce.start()
+
+    def _analyze_view(self):
+        self.view_debounce.stop()
+        limits = (*self.ax.get_xlim(), *self.ax.get_ylim())
+        if (not np.all(np.isfinite(limits)) or max(abs(v) for v in limits) > 10000
+                or limits[1]-limits[0] < .001 or limits[3]-limits[2] < .001):
+            return
+        for spin, value in zip(self.bounds, limits):
+            blocker = QSignalBlocker(spin)
+            spin.setValue(value)
+            del blocker
+        # Bounds controls and all subsequent sweeps use the new visible box.
+        self._info()
+        self.analyze()
+
+    def reset_view(self):
+        self.view_debounce.stop()
+        for spin, value in zip(self.bounds, self._home_bounds):
+            blocker = QSignalBlocker(spin)
+            spin.setValue(value)
+            del blocker
         self.draw(reset=True)
+        if self.initialized:
+            self.analyze()
 
     def _failed(self, key, message):
         if key == self.analysis_key:
@@ -235,6 +296,8 @@ class BifurcationPanel(QWidget):
         self.draw()
 
     def trace(self, *_args):
+        if self.view_debounce.isActive():
+            self._analyze_view()
         if self.result is None:
             self.status.setText("Analyze the current formula successfully before tracing.")
             return
@@ -269,7 +332,10 @@ class BifurcationPanel(QWidget):
             self.info.set_rows(["Enter a scalar system and select the analysis window."], self.fg)
             return
         rows = []
+        m0, m1, x0, x1 = (spin.value() for spin in self.bounds)
         for p in self.result["critical"]:
+            if not (m0 <= p["mu"] <= m1 and x0 <= p["x"] <= x1):
+                continue
             rows.append(f"$(\\mu,x)=({p['mu_text']},{p['x_text']})$    {p['kind']}    {p['stability']} at the critical parameter")
         rows += self.result["notes"]
         if self.trace_result:
@@ -285,6 +351,7 @@ class BifurcationPanel(QWidget):
         self.draw()
 
     def draw(self, reset=False):
+        self._drawing = True
         limits = (self.ax.get_xlim(), self.ax.get_ylim())
         self.ax.clear()
         bg, fg = ("#000000", "#ffffff") if self.dark else ("#ffffff", "#222222")
@@ -333,6 +400,11 @@ class BifurcationPanel(QWidget):
         else:
             self.ax.set_xlim(limits[0])
             self.ax.set_ylim(limits[1])
+        # Axes.clear() replaces the callback registry, so reinstall it after
+        # each redraw. Ignore programmatic redraws; observe actual view edits.
+        self.ax.callbacks.connect("xlim_changed", self._view_changed)
+        self.ax.callbacks.connect("ylim_changed", self._view_changed)
+        self._drawing = False
         self.canvas.draw_idle()
 
     def zoom(self, factor):
@@ -363,6 +435,7 @@ class BifurcationPanel(QWidget):
             self.figure.savefig(path, dpi=200, facecolor=self.figure.get_facecolor())
 
     def close_workers(self):
+        self.view_debounce.stop()
         self.debounce.stop()
         self.analysis.close()
         self.tracer.close()
