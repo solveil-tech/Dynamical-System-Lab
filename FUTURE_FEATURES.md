@@ -6,8 +6,9 @@ fixes and interface improvements only.
 
 ## Suggested order
 
-1. Nullclines: draw dx/dt = 0 and dy/dt = 0, optionally show signs in each region.
-   Nullclines must not be described as trajectories or invariant sets in general.
+1. Nullclines: dx/dt = 0 and dy/dt = 0 are now implemented following the user's
+   explicit request. Optional signs in each region remain deferred. Nullclines
+   must not be described as trajectories or invariant sets in general.
 2. Extend the initial-value/time display with trajectory comparison and linked
    selection between phase-space and time plots.
 3. Genuine 1D mode: phase line, f(x), equilibria and scalar stability. dy/dt = 0

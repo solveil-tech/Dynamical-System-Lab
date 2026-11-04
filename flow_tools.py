@@ -185,6 +185,10 @@ def validate_experiment(data):
     for name in ("normalized", "speed_colors", "dark", "vectors", "equilibria", "fixed_colors", "show_selected"):
         if not isinstance(settings.get(name), bool):
             raise ValueError(f"Invalid switch: {name}")
+    if not isinstance(settings.get("nullclines", False), bool):
+        raise ValueError("Invalid switch: nullclines")
+    if not isinstance(settings.get("first_quadrant", False), bool):
+        raise ValueError("Invalid switch: first_quadrant")
     bounds = data.get("bounds")
     if not isinstance(bounds, list) or len(bounds) != 4 or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and abs(v) <= 1e9 for v in bounds):
         raise ValueError("Invalid view bounds.")

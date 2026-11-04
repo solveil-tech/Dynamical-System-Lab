@@ -10,11 +10,30 @@ import operator
 import re
 import sys
 import time
+from functools import lru_cache
+from background_analysis import AnalysisProcess
 from pathlib import Path
 import numpy as np
+from parameter_notation import (
+    canonicalize_parameter_notation, display_parameter_name,
+    format_parameter_definitions, infer_parameter_names,
+    ENCODED_PARAMETER_PATTERN, display_parameter_expression,
+    subscript_exit_position,
+)
+from equilibrium_algebra import (
+    analyze_algebraic_equilibria, exact_point_text, exact_point_jacobian,
+    equilibrium_set_text, clean_numerical_point, unresolved_equilibrium_text,
+    is_hamiltonian_center,
+)
+from periodic_orbits import find_periodic_orbits
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect, QSignalBlocker, QEvent
-from PySide6.QtGui import QFontDatabase, QImage, QPixmap, QPainter, QSurfaceFormat, QVector4D
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QSizeF, QPointF, QRect, QRectF, QSignalBlocker, QEvent, QMimeData
+from PySide6.QtGui import (
+    QFont, QFontDatabase, QImage, QPixmap, QPainter, QSurfaceFormat, QVector4D,
+    QColor, QRawFont, QGlyphRun, QPyTextObject, QTextFormat,
+    QTextCharFormat, QTextCursor, QTextBlockFormat,
+    QSyntaxHighlighter,
+)
 from PySide6.QtOpenGL import (
     QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat,
     QOpenGLFunctions_3_3_Core, QOpenGLShader, QOpenGLShaderProgram,
@@ -27,10 +46,17 @@ from PySide6.QtWidgets import (
     QGridLayout, QFormLayout, QGroupBox, QLabel, QLineEdit,
     QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox,
     QSplitter, QAbstractSpinBox, QComboBox, QStackedWidget, QSizePolicy, QFrame, QScrollArea,
-    QTabWidget, QFileDialog,
+    QTabWidget, QFileDialog, QTextEdit, QToolButton,
+    QProxyStyle, QStyle, QStyleOption, QStyleOptionComboBox,
 )
 
+from matplotlib import rc_context
+from matplotlib.font_manager import FontProperties
+from matplotlib.mathtext import MathTextParser
 from matplotlib.figure import Figure
+from matplotlib.collections import LineCollection
+from matplotlib.path import Path as MathPath
+from matplotlib.patches import PathPatch
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
@@ -77,6 +103,9 @@ LATEX_SYMBOLS = {
     r"\epsilon": "ε", r"\theta": "θ", r"\lambda": "λ", r"\mu": "μ",
     r"\rho": "ρ", r"\sigma": "σ", r"\tau": "τ", r"\omega": "ω",
     r"\zeta": "ζ",
+    r"\eta": "η", r"\iota": "ι", r"\kappa": "κ", r"\nu": "ν",
+    r"\xi": "ξ", r"\omicron": "ο", r"\pi": "π", r"\upsilon": "υ",
+    r"\phi": "φ", r"\chi": "χ", r"\psi": "ψ",
 }
 
 
@@ -98,9 +127,57 @@ SUBSCRIPT_TO_ASCII = dict(zip("₀₁₂₃₄₅₆₇₈₉", "0123456789"))
 ASCII_TO_SUBSCRIPT = {value: key for key, value in SUBSCRIPT_TO_ASCII.items()}
 
 
+def _normalize_absolute_bars(text):
+    """Resolve paired absolute-value bars; leave unfinished input editable."""
+    if not any(char in text for char in "|∣‖"):
+        return text
+    source = text.replace("∣", "|").replace("‖", "|")
+    output = []
+    depth = 0
+    expects_operand = True
+    for char in source:
+        if char == "|":
+            if depth and not expects_operand:
+                output.append(")")
+                depth -= 1
+                expects_operand = False
+            else:
+                output.append("abs(")
+                depth += 1
+                expects_operand = True
+        else:
+            output.append(char)
+            if not char.isspace():
+                expects_operand = char in "(,+-*/%^−·×÷"
+    return "".join(output) if depth == 0 else text
+
+
+def _display_absolute_bars(text):
+    """Show absolute values with bars while retaining editable inner formulas."""
+    output, stack = [], []
+    index = 0
+    while index < len(text):
+        if text.startswith("abs(", index):
+            output.append("|")
+            stack.append(True)
+            index += 4
+            continue
+        char = text[index]
+        if char == "(":
+            stack.append(False)
+        elif char == ")" and stack:
+            if stack.pop():
+                char = "|"
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+@lru_cache(maxsize=128)
 def normalize_display_expression(text):
     """Convert the editor's typographic symbols back into parser syntax."""
-    text = normalize_latex_symbols(text.strip())
+    text = _normalize_absolute_bars(normalize_latex_symbols(text.strip()))
+    text = canonicalize_parameter_notation(text)
     text = text.replace("π", "pi").replace("·", "*").replace("×", "*")
     text = text.replace("÷", "/").replace("−", "-")
     text = re.sub(r"[₀₁₂₃₄₅₆₇₈₉]+", lambda m: "".join(SUBSCRIPT_TO_ASCII[c] for c in m.group()), text)
@@ -129,7 +206,8 @@ def normalize_display_expression(text):
 
 _FORMULA_TOKEN_PATTERN = re.compile(
     r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
-    r"|(?:[^\W\d]|_)\w*|\*\*|[()+\-*/%^,]",
+    + "|" + ENCODED_PARAMETER_PATTERN
+    + r"|(?:[^\W\d]|_)\w*|\*\*|[()+\-*/%^,]",
     re.UNICODE,
 )
 
@@ -144,25 +222,29 @@ def _split_implicit_identifier(value, parameter_names, followed_by_call=False):
         atoms.update(FUNCTIONS)
     atoms = sorted(atoms, key=len, reverse=True)
 
-    def split_from(index):
-        if index == len(value):
-            return []
+    links = {len(value): None}
+    for index in range(len(value)-1, -1, -1):
         candidates = [atom for atom in atoms if value.startswith(atom, index)]
         if followed_by_call and index == 0:
             candidates = [atom for atom in candidates if atom not in FUNCTIONS]
         for atom in candidates:
-            rest = split_from(index + len(atom))
-            if rest is not None and (atom not in FUNCTIONS or index + len(atom) == len(value)):
-                return [atom, *rest]
-        if index > 0:
+            end = index+len(atom)
+            if end in links and (atom not in FUNCTIONS or end == len(value)):
+                links[index] = (atom, end)
+                break
+        if index not in links and index > 0:
             number = re.match(r"\d+(?:\.\d*)?|\.\d+", value[index:])
             if number:
-                rest = split_from(index + len(number.group()))
-                if rest is not None:
-                    return [number.group(), *rest]
+                end = index+len(number[0])
+                if end in links:
+                    links[index] = (number[0], end)
+    parts = []
+    index = 0
+    while index < len(value) and index in links:
+        atom, index = links[index]
+        parts.append(atom)
+    if index != len(value):
         return None
-
-    parts = split_from(0)
     return parts if parts and len(parts) > 1 else None
 
 
@@ -231,12 +313,72 @@ def _insert_implicit_multiplication(text, parameter_names=(), preserve_scientifi
     return "".join(output)
 
 
+def _group_product_unaries(text):
+    """Make a hidden product before a unary sign unambiguous: x*(-y)."""
+    if not re.search(r"(?<!\*)\*(?!\*)\s*[+-]", text):
+        return text
+    try:
+        source = text.replace("^", "**")
+        tree = ast.parse(source, mode="eval")
+    except (SyntaxError, ValueError):
+        return text
+    lines = source.encode("utf-8").splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    insertions = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult) and isinstance(node.right, ast.UnaryOp):
+            operand = node.right
+            insertions.extend([
+                (offsets[operand.lineno - 1] + operand.col_offset, b"("),
+                (offsets[operand.end_lineno - 1] + operand.end_col_offset, b")"),
+            ])
+    data = source.encode("utf-8")
+    for position, character in sorted(insertions, reverse=True):
+        data = data[:position] + character + data[position:]
+    return data.decode("utf-8")
+
+
+def _hide_product_symbols(text, parameter_names):
+    """Remove product marks only when the parser reconstructs the same tokens."""
+    def tokens(expression):
+        normalized = normalize_display_expression(expression)
+        names = infer_parameter_names(
+            [normalized], parameter_names,
+            set(FUNCTIONS) | {"x", "y", "z", "r", "θ", "theta", "pi", "e"})
+        expression = _insert_implicit_multiplication(
+            normalized, names,
+            preserve_scientific_prefix=True,
+        ).replace("**", "^")
+        return [match.group() for match in _FORMULA_TOKEN_PATTERN.finditer(expression)]
+
+    expected = tokens(text)
+    if "*" not in text:
+        return text
+    # Validate the entire batch, rather than reparsing for every product.
+    # Keep an unfinished final '*' so a second keystroke can still form '**'.
+    suffix = "*" if text.endswith("*") else ""
+    body = text[:-1] if suffix else text
+    for separator in ("", " "):
+        candidate = body.replace("*", separator) + suffix
+        if tokens(candidate) == expected:
+            return candidate
+    return text
+
+
 def format_formula_input(text, parameter_names=()):
+    return _format_formula_cached(text, tuple(sorted(parameter_names)))
+
+
+@lru_cache(maxsize=128)
+def _format_formula_cached(text, parameter_names):
     """Render powers and implicit products as typographic math in-place."""
     text = normalize_display_expression(text)
     text = _insert_implicit_multiplication(
         text, parameter_names, preserve_scientific_prefix=True
-    ).replace("**", "^")
+    )
+    text = _group_product_unaries(text).replace("**", "^")
 
     def format_power(match):
         exponent = match.group("exponent")
@@ -247,10 +389,13 @@ def format_formula_input(text, parameter_names=()):
             return match.group("base") + "⁽" + "".join(ASCII_TO_SUPERSCRIPT[c] for c in value) + "⁾"
         if any(char not in ASCII_TO_SUPERSCRIPT for char in exponent):
             return match.group(0)
-        return match.group("base") + "".join(ASCII_TO_SUPERSCRIPT[c] for c in exponent)
+        base = match.group("base")
+        if "__ode_up_" in base and not (base.startswith("(") and base.endswith(")")):
+            base = "(" + base + ")"
+        return base + "".join(ASCII_TO_SUPERSCRIPT[c] for c in exponent)
 
     power_pattern = re.compile(
-        r"(?P<base>(?:[A-Za-z_Α-Ωα-ωπ][A-Za-z_0-9Α-Ωα-ωπ]*|\([^()]*\)))"
+        r"(?P<base>(?:(?<!\w)[A-Za-z_Α-Ωα-ωπ][A-Za-z_0-9Α-Ωα-ωπ]*|\([^()]*\)))"
         r"\s*\^\s*(?P<exponent>\([^()]*\)|[+-]?(?:\d+(?:\.\d*)?|\.\d+)|[A-Za-z_Α-Ωα-ω][A-Za-z_0-9Α-Ωα-ω]*)"
     )
     for _ in range(4):
@@ -261,7 +406,7 @@ def format_formula_input(text, parameter_names=()):
     # The editor may receive the two asterisks of x**2 in separate keystrokes.
     # Normalize the completed numeric power once more so it always displays as a superscript.
     text = re.sub(
-        r"(?P<base>(?:[^\W\d_]\w*|\([^()]*\)))\^(?P<exponent>[+-]?\d+)",
+        r"(?P<base>(?:(?<!\w)[^\W\d_]\w*|\([^()]*\)))\^(?P<exponent>[+-]?\d+)",
         lambda match: match.group("base") + "".join(
             ASCII_TO_SUPERSCRIPT.get(char, char) for char in match.group("exponent")
         ),
@@ -269,12 +414,9 @@ def format_formula_input(text, parameter_names=()):
         flags=re.UNICODE,
     )
     text = re.sub(r"\bpi\b", "π", text)
-    text = re.sub(
-        r"\b([A-Za-z]+)(\d+)\b",
-        lambda m: m.group(1) + "".join(ASCII_TO_SUBSCRIPT.get(c, c) for c in m.group(2)),
-        text,
-    )
-    return text.replace("*", "·").replace("-", "−")
+    text = display_parameter_expression(text, FUNCTIONS)
+    text = _display_absolute_bars(text)
+    return _hide_product_symbols(text, parameter_names).replace("-", "−")
 BINARY_OPS = {
     ast.Add: operator.add, ast.Sub: operator.sub,
     ast.Mult: operator.mul, ast.Div: operator.truediv,
@@ -329,6 +471,8 @@ def eval_node(node, variables):
 
 def compile_formula(text, parameter_names=()):
     text = normalize_display_expression(text)
+    if any(char in text for char in "|∣‖"):
+        raise ValueError("Absolute value bars must enclose an expression, for example |x|.")
     text = _insert_implicit_multiplication(text, parameter_names).replace("^", "**")
     if not text:
         raise ValueError("Formula cannot be empty.")
@@ -475,7 +619,9 @@ def evaluate_3d(tree, x, y, z, params):
 
 def _field_vector(fields, point, params):
     variables = dict(zip(("x", "y", "z"), point))
-    return np.asarray([eval_node(field, variables | params) for field in fields], dtype=float)
+    # Search iterates may lie on a pole; the caller rejects non-finite values.
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore", under="ignore"):
+        return np.asarray([eval_node(field, variables | params) for field in fields], dtype=float)
 
 
 def _value_and_gradient(node, variables, params):
@@ -586,6 +732,88 @@ def _field_jacobian(fields, point, params):
     return np.asarray([row[1] for row in rows], dtype=float)
 
 
+def _equilibrium_correction(jacobian, value, x_axis_only=False):
+    """Keep small, essential Newton directions in ill-conditioned systems."""
+    if x_axis_only:
+        reduced = np.linalg.lstsq(jacobian[:, :1], value, rcond=None)[0]
+        return np.array([reduced[0], 0.0])
+    try:
+        # A pseudoinverse may discard a small singular value, giving an almost
+        # zero correction even though the iterate is still far from a root.
+        return np.linalg.solve(jacobian, value)
+    except np.linalg.LinAlgError:
+        step = np.linalg.lstsq(jacobian, value, rcond=None)[0]
+        defect = np.abs(jacobian @ step - value)
+        error_scale = np.abs(jacobian) @ np.abs(step) + np.abs(value)
+        if np.any(defect > 128 * np.finfo(float).eps * error_scale):
+            raise np.linalg.LinAlgError("Singular Jacobian cannot resolve the field residual")
+        return step
+
+
+def _equilibrium_domain_guards(fields, params):
+    """Expressions whose zero sets are excluded from the original domain."""
+    guards = []
+    for field in fields:
+        for node in ast.walk(field):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+                guards.append((node.right, False))
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+                try:
+                    exponent = float(eval_node(node.right, params))
+                except (ArithmeticError, KeyError, TypeError, ValueError):
+                    continue
+                if exponent < 0:
+                    guards.append((node.left, False))
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id in ("log", "ln", "log10") and node.args):
+                guards.append((node.args[0], True))
+    return guards
+
+
+def _equilibrium_position_tolerance(guards, point, params, absolute_tolerance):
+    """Require convergence relative to nearby poles as well as the view scale.
+
+    This does not exclude a fixed neighbourhood of a singularity: a genuine
+    root arbitrarily close to it can pass if its Newton correction is small
+    enough relative to its distance from the excluded set.
+    """
+    variables = dict(zip(("x", "y", "z"), point))
+    tolerance = absolute_tolerance
+    for guard, positive in guards:
+        result = _value_and_gradient(guard, variables, params)
+        value = float(eval_node(guard, variables | params))
+        if not math.isfinite(value) or value == 0 or (positive and value < 0):
+            return 0.0
+        if result is not None:
+            gradient_norm = float(np.linalg.norm(result[1]))
+            if gradient_norm > 0:
+                clearance = abs(value) / gradient_norm
+                tolerance = min(tolerance, 1e-7 * clearance)
+    return tolerance
+
+
+def sample_nullclines(fields, params, bounds, resolution=401):
+    """Sample the original field, masking poles instead of contouring across them."""
+    xmin, xmax, ymin, ymax = bounds
+    x, y = np.meshgrid(np.linspace(xmin, xmax, resolution),
+                       np.linspace(ymin, ymax, resolution))
+    values = [np.broadcast_to(evaluate(field, x, y, params), x.shape) for field in fields]
+    mask = np.logical_or.reduce([~np.isfinite(value) for value in values])
+    for guard, positive in _equilibrium_domain_guards(fields, params):
+        denominator = np.broadcast_to(evaluate(guard, x, y, params), x.shape)
+        mask |= ~np.isfinite(denominator) | (denominator == 0)
+        if positive:
+            mask |= denominator < 0
+        corners = np.stack((denominator[:-1, :-1], denominator[1:, :-1],
+                            denominator[:-1, 1:], denominator[1:, 1:]))
+        crosses_pole = (np.min(corners, axis=0) <= 0) & (np.max(corners, axis=0) >= 0)
+        # Exclude the complete cell around a pole/sign jump. A zero contour
+        # through a division discontinuity is not a genuine nullcline.
+        for dy, dx in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            mask[dy:dy + resolution - 1, dx:dx + resolution - 1] |= crosses_pole
+    return x, y, [np.ma.array(value, mask=mask) for value in values]
+
+
 def find_equilibria(fields, params, bounds, grid_size=None, x_axis_only=False):
     """Find isolated equilibria from a grid of Newton seeds within a search box."""
     dimension = len(fields)
@@ -616,7 +844,8 @@ def find_equilibria(fields, params, bounds, grid_size=None, x_axis_only=False):
         except (ArithmeticError, FloatingPointError, TypeError, ValueError):
             pass
     residual_tolerance = 1e-12 * field_scale
-    point_tolerance = 1e-7 * scale
+    point_tolerance = 1e-10 * scale
+    domain_guards = _equilibrium_domain_guards(fields, params)
     accepted = []
 
     for seed in seeds:
@@ -634,17 +863,17 @@ def find_equilibria(fields, params, bounds, grid_size=None, x_axis_only=False):
                 jacobian = _field_jacobian(fields, point, params)
                 if jacobian is None:
                     break
-                if x_axis_only and dimension == 2:
-                    reduced = np.linalg.lstsq(jacobian[:, :1], value, rcond=None)[0]
-                    step = np.array([reduced[0], 0.0])
-                else:
-                    step = np.linalg.lstsq(jacobian, value, rcond=None)[0]
+                step = _equilibrium_correction(jacobian, value, x_axis_only and dimension == 2)
+                convergence_tolerance = _equilibrium_position_tolerance(
+                    domain_guards, point, params, point_tolerance,
+                )
             except (ArithmeticError, FloatingPointError, TypeError, ValueError, np.linalg.LinAlgError):
                 break
             if not np.all(np.isfinite(step)):
                 break
             step_norm = float(np.linalg.norm(step))
-            if residual <= residual_tolerance and step_norm <= point_tolerance:
+            if (convergence_tolerance > 0 and residual <= residual_tolerance
+                    and step_norm <= convergence_tolerance):
                 converged = True
                 break
             if residual == 0.0:
@@ -676,14 +905,17 @@ def find_equilibria(fields, params, bounds, grid_size=None, x_axis_only=False):
                 final_jacobian = _field_jacobian(fields, point, params)
                 if final_jacobian is None:
                     continue
-                final_step = np.linalg.lstsq(
-                    final_jacobian[:, :1] if x_axis_only and dimension == 2 else final_jacobian,
-                    final_value, rcond=None,
-                )[0]
+                final_step = _equilibrium_correction(
+                    final_jacobian, final_value, x_axis_only and dimension == 2,
+                )
+                convergence_tolerance = _equilibrium_position_tolerance(
+                    domain_guards, point, params, point_tolerance,
+                )
                 converged = (
                     np.all(np.isfinite(final_value))
+                    and convergence_tolerance > 0
                     and np.linalg.norm(final_value) <= residual_tolerance
-                    and np.linalg.norm(final_step) <= point_tolerance
+                    and np.linalg.norm(final_step) <= convergence_tolerance
                 )
             except (ArithmeticError, FloatingPointError, TypeError, ValueError, np.linalg.LinAlgError):
                 converged = False
@@ -706,6 +938,8 @@ def find_equilibria(fields, params, bounds, grid_size=None, x_axis_only=False):
                 accepted[duplicate] = point
 
     accepted.sort(key=lambda point: tuple(point))
+    accepted = [np.asarray(clean_numerical_point(fields, params, point), dtype=float)
+                for point in accepted]
     return [(point, classify_equilibrium(fields, point, params)) for point in accepted]
 
 
@@ -739,10 +973,11 @@ def _is_affine_field(fields):
     return all(_expression_degree(field, {"x", "y", "z"}) <= 1 for field in fields)
 
 
-def classify_equilibrium(fields, point, params):
+def classify_equilibrium(fields, point, params, exact_jacobian=None):
     """Return the local type and whether its linearization is hyperbolic."""
     dimension = len(fields)
-    jacobian = _field_jacobian(fields, point, params)
+    jacobian = (_field_jacobian(fields, point, params) if exact_jacobian is None else
+                np.asarray(exact_jacobian, dtype=float))
     if jacobian is None or not np.all(np.isfinite(jacobian)):
         return {"type": "Jacobian unavailable", "hyperbolic": None,
                 "linearization": "Inconclusive (Jacobian unavailable).",
@@ -1273,12 +1508,26 @@ def parse_parameters(text):
         name, value = (part.strip() for part in item.split("=", 1))
         if not name.isidentifier():
             raise ValueError(f"Invalid parameter symbol: {name}")
+        if _insert_implicit_multiplication(name, (name,)) != name:
+            raise ValueError("Use a single parameter symbol before '='.")
         if name in {"x", "y", "z", "pi", "e"} or name in FUNCTIONS:
             raise ValueError(f"Reserved parameter symbol: {name}")
         number = float(value)
         if not np.isfinite(number):
             raise ValueError("Parameters must be finite numbers.")
         params[name] = number
+    return params
+
+
+def parameters_for_equations(expressions, definitions, polar=False):
+    params = parse_parameters(definitions)
+    reserved = set(FUNCTIONS) | {"x", "y", "z", "pi", "e"}
+    if polar:
+        reserved |= {"r", "θ", "theta"}
+    names = infer_parameter_names(
+        [normalize_display_expression(text) for text in expressions], params, reserved)
+    for name in sorted(names):
+        params.setdefault(name, 1.0)
     return params
 
 
@@ -1336,6 +1585,192 @@ def compile_glsl(node, params):
         name = {"ln": "log", "minimum": "min", "maximum": "max", "atan2": "atan"}.get(name, name)
         return f"{name}({', '.join(args)})"
     raise ValueError(f"Unsupported expression element: {type(node).__name__}")
+
+
+class _ParameterSubscriptHighlighter(QSyntaxHighlighter):
+    def highlightBlock(self, text):
+        for match in re.finditer(r"(?<![A-Za-zΑ-Ωα-ω])([A-Za-zΑ-Ωα-ω]+)(_)([A-Za-zΑ-Ωα-ω0-9]+)", text):
+            hidden = QTextCharFormat()
+            hidden.setFontPointSize(0.1)
+            hidden.setForeground(Qt.GlobalColor.transparent)
+            self.setFormat(match.start(2), 1, hidden)
+            script = QTextCharFormat()
+            script.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSubScript)
+            self.setFormat(match.start(3), len(match[3]), script)
+
+
+class NotationLineEdit(QTextEdit):
+    """Single-line native text editing with real letter-subscript typography."""
+    textChanged = Signal(str)
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setAcceptRichText(False)
+        self.setTabChangesFocus(True)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.document().setDocumentMargin(0)
+        self.setViewportMargins(0, 0, 0, 0)
+        self.setFixedHeight(self.fontMetrics().height()+12)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._script_highlighter = _ParameterSubscriptHighlighter(self.document())
+        self._clear_enabled = False
+        self._last_plain_text = ""
+        self._clear_button = QPushButton(self)
+        self._clear_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_LineEditClearButton))
+        self._clear_button.setIconSize(QSize(13, 13))
+        self._clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._clear_button.setToolTip("Clear")
+        self._clear_button.setFixedSize(17, 17)
+        self._clear_button.setStyleSheet(
+            "QPushButton { border: none; background: transparent; padding: 0; font-size: 16px; }")
+        self._clear_button.clicked.connect(self.clear)
+        self._clear_button.hide()
+        self.document().contentsChanged.connect(self._contents_changed)
+        self.setText(text)
+
+    def _contents_changed(self):
+        text = self.text()
+        self._clear_button.setVisible(self._clear_enabled and bool(text))
+        if text != self._last_plain_text:
+            self._last_plain_text = text
+            self.textChanged.emit(text)
+
+    def text(self):
+        return self.toPlainText()
+
+    def setText(self, text):
+        self.setPlainText(text.replace("\n", " ").replace("\r", " "))
+        self.setCursorPosition(len(self.text()))
+
+    def cursorPosition(self):
+        return self.textCursor().position()
+
+    def setCursorPosition(self, position):
+        cursor = self.textCursor()
+        cursor.setPosition(max(0, min(position, len(self.text()))))
+        self.setTextCursor(cursor)
+
+    def selectionStart(self):
+        cursor = self.textCursor()
+        return cursor.selectionStart() if cursor.hasSelection() else -1
+
+    def selectedText(self):
+        return self.textCursor().selectedText()
+
+    def hasSelectedText(self):
+        return self.textCursor().hasSelection()
+
+    def setSelection(self, start, length):
+        cursor = self.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(start+length, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cursor)
+
+    def insert(self, text):
+        self.insertPlainText(text.replace("\n", " ").replace("\r", " "))
+
+    def setClearButtonEnabled(self, enabled):
+        self._clear_enabled = bool(enabled)
+        self.setViewportMargins(0, 0, 17 if enabled else 0, 0)
+        self._clear_button.setVisible(enabled and bool(self.text()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._clear_button.move(self.width()-21, (self.height()-17)//2)
+
+    def keyPressEvent(self, event):
+        if (event.key() == Qt.Key.Key_Right
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and not self.hasSelectedText()):
+            end = subscript_exit_position(self.text(), self.cursorPosition())
+            if end is not None:
+                self.setCursorPosition(end)
+                if end < len(self.text()) and self.text()[end].isspace():
+                    self.setCursorPosition(end+1)
+                else:
+                    # A space terminates an index without showing a product
+                    # symbol. Keep it while empty; the next edit formats normally.
+                    blocker = QSignalBlocker(self)
+                    self.insert(" ")
+                    del blocker
+                return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            return
+        super().keyPressEvent(event)
+
+    def insertFromMimeData(self, source):
+        self.insert(source.text())
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+    def sizeHint(self):
+        return QSize(160, self.height())
+
+    def minimumSizeHint(self):
+        return QSize(30, self.height())
+
+
+class _ComboArrowStyle(QProxyStyle):
+    def drawComplexControl(self, control, option, painter, widget=None):
+        if control != QStyle.ComplexControl.CC_ComboBox or not isinstance(widget, PopupComboBox):
+            return super().drawComplexControl(control, option, painter, widget)
+        frame = QStyleOptionComboBox(option)
+        frame.subControls &= ~QStyle.SubControl.SC_ComboBoxArrow
+        super().drawComplexControl(control, frame, painter, widget)
+        if option.subControls & QStyle.SubControl.SC_ComboBoxArrow:
+            arrow = QStyleOption()
+            arrow.initFrom(widget)
+            arrow.rect = self.subControlRect(control, option, QStyle.SubControl.SC_ComboBoxArrow, widget)
+            element = (QStyle.PrimitiveElement.PE_IndicatorArrowUp if widget._popup_open
+                       else QStyle.PrimitiveElement.PE_IndicatorArrowDown)
+            super().drawPrimitive(element, arrow, painter, widget)
+
+
+class PopupComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup_open = False
+        # Use an independent instance of the current style to preserve its frame,
+        # spacing and colors while changing only the arrow's direction.
+        self._arrow_style = _ComboArrowStyle(QApplication.style().objectName() or "Fusion")
+        self._arrow_style.setParent(self)
+        self.setStyle(self._arrow_style)
+        self.view().window().installEventFilter(self)
+
+    def showPopup(self):
+        self._popup_open = True
+        super().showPopup()
+        self._popup_open = self.view().isVisible()
+        if self._popup_open:
+            # The stylesheet can make Qt align the selected popup row over
+            # the closed control. Keep the entire control (and arrow) visible.
+            popup = self.view().window()
+            control = QRect(self.mapToGlobal(self.rect().topLeft()), self.size())
+            available = self.screen().availableGeometry()
+            below = max(0, available.bottom() - control.bottom())
+            above = max(0, control.top() - available.top())
+            open_below = popup.height() <= below or below >= above
+            room = below if open_below else above
+            height = min(popup.height(), max(1, room))
+            width = min(popup.width(), available.width())
+            x = max(available.left(), min(control.left(), available.right() - width + 1))
+            y = control.bottom() + 1 if open_below else control.top() - height
+            popup.setGeometry(x, y, width, height)
+        self.update()
+
+    def hidePopup(self):
+        super().hidePopup()
+        self._popup_open = False
+        self.update()
+
+    def eventFilter(self, watched, event):
+        if watched is self.view().window() and event.type() == QEvent.Type.Hide:
+            self._popup_open = False
+            self.update()
+        return super().eventFilter(watched, event)
 
 
 class NoWheelSpinBox(QSpinBox):
@@ -1795,7 +2230,7 @@ class FlowCanvas(QOpenGLWidget):
     """
     TRAIL_VS = """#version 330 core
     uniform sampler2D u_history_x,u_history_y,u_history_birth;
-    uniform float u_count,u_history_length,u_history_latest,u_frame,u_samples_per_frame;
+    uniform float u_count,u_history_length,u_history_latest,u_frame,u_samples_per_frame,u_segments;
     out vec2 trail_a,trail_b;out float trail_age_a,trail_age_b,trail_birth_fade;
     flat out int trail_valid;
     float decodeF(vec4 c){uvec4 b=uvec4(round(c*255.0));uint n=(b.r<<24u)|(b.g<<16u)|(b.b<<8u)|b.a;return uintBitsToFloat(n);}
@@ -1807,8 +2242,8 @@ class FlowCanvas(QOpenGLWidget):
       int row=(int(u_history_latest)-age+int(u_history_length)*int(u_history_length))%int(u_history_length);
       vec2 uv=vec2((float(particle)+0.5)/u_count,(float(row)+0.5)/u_history_length);
       return decodeF(texture(u_history_birth,uv));}
-    void main(){int segment=gl_VertexID%int(u_history_length-1.0);
-      int particle=gl_VertexID/int(u_history_length-1.0);
+    void main(){int segment=gl_VertexID%int(u_segments);
+      int particle=gl_VertexID/int(u_segments);
       gl_Position=vec4(0.0,0.0,0.0,1.0);trail_valid=0;
       trail_a=vec2(0.0);trail_b=vec2(0.0);trail_age_a=1.0;trail_age_b=1.0;trail_birth_fade=0.0;
       float newer_birth=sample_birth(particle,segment);
@@ -1961,7 +2396,8 @@ class FlowCanvas(QOpenGLWidget):
             self.doneCurrent()
 
     def set_background(self, background_png, plot_rect):
-        self.background_image = QImage.fromData(background_png, "PNG")
+        self.background_image = (background_png if isinstance(background_png, QImage)
+                                 else QImage.fromData(background_png, "PNG"))
         self.plot_rect = tuple(float(v) for v in plot_rect)
         if self.ready:
             self.makeCurrent()
@@ -2155,8 +2591,13 @@ class FlowCanvas(QOpenGLWidget):
             return
         gl.glBindFramebuffer(self.FRAMEBUFFER, self.defaultFramebufferObject())
         ratio = self.devicePixelRatioF()
-        gl.glViewport(0, 0, int(self.width()*ratio), int(self.height()*ratio))
-        gl.glClearColor(0.0, 0.0, 0.0, 1.0)
+        # Match Qt's rounded framebuffer size at fractional display scaling.
+        # Truncating an odd logical size can leave an uncovered black edge.
+        physical_size = self.size() * ratio
+        width, height = physical_size.width(), physical_size.height()
+        gl.glViewport(0, 0, width, height)
+        background = 0.0 if self.dark_mode else 1.0
+        gl.glClearColor(background, background, background, 1.0)
         gl.glClear(self.COLOR_BIT)
         self.vao.bind()
         if self.background_texture is not None and self.background_texture.isCreated():
@@ -2167,7 +2608,7 @@ class FlowCanvas(QOpenGLWidget):
             gl.glDrawArrays(self.TRIANGLES, 0, 3)
             self.background_program.release()
         if self.ready:
-            self._draw_trail_history(int(self.width()*ratio), int(self.height()*ratio))
+            self._draw_trail_history(width, height)
         self.vao.release()
 
     def _make_program(self, vs, fs, geometry=None):
@@ -2295,12 +2736,13 @@ class FlowCanvas(QOpenGLWidget):
             return
         for fbo, values in zip(self.history_fbos, (xs, ys)):
             raw = np.ascontiguousarray(np.asarray(values, dtype=">f4").view(np.uint8))
-            rows = np.broadcast_to(raw, (self.history_length, raw.size)).copy()
             self._bind_texture(0, fbo.texture())
-            _upload_rgba8(rows, len(values), start, height=self.history_length)
-        birth_raw = np.zeros((self.history_length, len(xs), 4), dtype=np.uint8)
+            # Only this initial row is read before recorded samples replace
+            # the ring. Older rows are excluded by the valid segment count.
+            _upload_rgba8(raw, len(values), start, self.history_length - 1)
+        birth_raw = np.zeros((len(xs), 4), dtype=np.uint8)
         self._bind_texture(0, self.history_birth_fbo.texture())
-        _upload_rgba8(birth_raw, len(xs), start, height=self.history_length)
+        _upload_rgba8(birth_raw, len(xs), start, self.history_length - 1)
 
     def _respawn_indices(self, indices, positions):
         if len(indices) == 0:
@@ -2406,6 +2848,9 @@ class FlowCanvas(QOpenGLWidget):
         self.history_frame += 1
 
     def _draw_trail_history(self, width, height):
+        segments = min(self.history_frame, self.history_length - 1)
+        if segments <= 0:
+            return
         gl = self.gl
         gl.glEnable(self.BLEND)
         gl.glBlendFunc(self.ONE, self.ONE_MINUS_SRC_ALPHA)
@@ -2417,6 +2862,7 @@ class FlowCanvas(QOpenGLWidget):
         self._set_uniform(self.trail_program, "u_history_y", 1)
         self._set_uniform(self.trail_program, "u_history_birth", 2)
         self._set_uniform(self.trail_program, "u_count", float(self.count))
+        self._set_uniform(self.trail_program, "u_segments", float(segments))
         self._set_uniform(self.trail_program, "u_history_length", float(self.history_length))
         self._set_uniform(self.trail_program, "u_samples_per_frame", float(self.SAMPLES_PER_FRAME))
         self._set_uniform(self.trail_program, "u_history_latest", float(self.history_latest))
@@ -2436,7 +2882,7 @@ class FlowCanvas(QOpenGLWidget):
         gl.glEnable(self.SCISSOR_TEST)
         gl.glScissor(int(left*width), int(bottom*height),
                      max(1, int((right-left)*width)), max(1, int((top-bottom)*height)))
-        gl.glDrawArrays(self.POINTS, 0, self.count*(self.history_length-1))
+        gl.glDrawArrays(self.POINTS, 0, self.count*segments)
         gl.glDisable(self.SCISSOR_TEST)
         self.trail_program.release()
         gl.glDisable(self.BLEND)
@@ -2549,7 +2995,7 @@ class Flow3DCanvas(QWidget):
         self.ax.set_ylabel("y", labelpad=4)
         self.ax.set_zlabel("z", labelpad=4)
         self.ax.view_init(elev=25, azim=-55)
-        self.ax.set_title("3D PHASE SPACE  ·  DRAG TO ROTATE  ·  SCROLL TO ZOOM", color=fg,
+        self.ax.set_title("3D PHASE SPACE (drag to rotate, scroll to zoom)", color=fg,
                           fontsize=9, pad=12, fontweight="bold")
         self._marker, = self.ax.plot([], [], [], marker="o", markersize=5,
                                      color="#ff7b54" if dark else "#e84b2c", linestyle="None")
@@ -2595,7 +3041,7 @@ class Flow3DCanvas(QWidget):
             values = np.asarray([point for point, _details in points], dtype=float)
             self._equilibrium_artist = self.ax.scatter(
                 values[:, 0], values[:, 1], values[:, 2],
-                s=34, marker="o", color="#ffad33" if self._dark else "#d98200",
+                s=34, marker="o", color="#ff6262" if self._dark else "#df3030",
                 edgecolors="none", linewidths=0, depthshade=False, zorder=8,
             )
         self.canvas.draw_idle()
@@ -2709,6 +3155,173 @@ ODE_POLAR_MODEL_PRESETS = {
 }
 
 
+class InlineMathObject(QPyTextObject):
+    """Typeset TeX math as live vector glyphs inside a Qt text document."""
+    object_type = QTextFormat.ObjectTypes.UserObject + 1
+    expression_property = QTextFormat.Property.UserProperty + 1
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parser = MathTextParser("path")
+        self.cache = {}
+        self.font_cache = {}
+
+    def layout(self, document, text_format):
+        expression = text_format.property(self.expression_property)
+        font = document.defaultFont()
+        dpi = self.parent().logicalDpiY()
+        key = (expression, font.toString(), dpi)
+        if key not in self.cache:
+            if len(self.cache) >= 256:
+                self.cache.clear()
+            family = font.family()
+            size = font.pointSizeF()
+            if size <= 0:
+                size = font.pixelSize() * 72.0 / dpi
+            settings = {
+                "mathtext.fontset": "custom", "mathtext.default": "regular",
+                "mathtext.rm": family, "mathtext.it": family + ":italic",
+                "mathtext.bf": family + ":bold", "mathtext.sf": family,
+                "mathtext.fallback": "stixsans",
+            }
+            with rc_context(settings):
+                expression = re.sub(
+                    r"(?<![A-Za-z])([+-]?\d+(?:\.\d*)?)[eE]([+-]?\d+)",
+                    lambda match: match[1] + r"\times 10^{" + str(int(match[2])) + "}",
+                    expression,
+                )
+                # Inline \frac shrinks its numerator and denominator to 70%.
+                # Keep ordinary fraction content at the surrounding UI size.
+                expression = re.sub(r"\\(?:t?frac)\b", r"\\dfrac", expression)
+                if r"\dfrac" in expression:
+                    expression = re.sub(
+                        r"(?<!\\left)(?<!\\right)[()]",
+                        lambda match: r"\left(" if match[0] == "(" else r"\right)",
+                        expression,
+                    )
+                self.cache[key] = self.parser.parse(
+                    "$" + expression + "$", dpi=dpi,
+                    prop=FontProperties(family=family, size=size),
+                )
+        return self.cache[key]
+
+    def intrinsicSize(self, document, position, text_format):
+        layout = self.layout(document, text_format)
+        return QSizeF(layout.width + 2, layout.height)
+
+    def drawObject(self, painter, rectangle, document, position, text_format):
+        layout = self.layout(document, text_format)
+        baseline = rectangle.bottom() - layout.depth
+        painter.save()
+        painter.setPen(text_format.foreground().color())
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        for glyph in layout.glyphs:
+            font, size, character = glyph[:3]
+            x, y = glyph[-2:]
+            # Use Qt's actual interface font face, including its weight and
+            # collection face, rather than mixing in TeX/STIX text glyphs.
+            ui_font = QFont(document.defaultFont())
+            ui_font.setPointSizeF(size)
+            key = (ui_font.toString(), self.parent().logicalDpiY())
+            if key not in self.font_cache:
+                self.font_cache[key] = QRawFont.fromFont(ui_font)
+            raw_font = self.font_cache[key]
+            if character == 0x221A or font.family_name.startswith("STIXSize"):
+                # Stretched operators must retain the typesetter's geometry:
+                # radicals meet their overbars; delimiters span the fraction.
+                operator_key = (font.fname, size, self.parent().logicalDpiY())
+                if operator_key not in self.font_cache:
+                    self.font_cache[operator_key] = QRawFont(
+                        str(font.fname), size * operator_key[2] / 72.0)
+                raw_font = self.font_cache[operator_key]
+            elif not raw_font.supportsCharacter(character):
+                # Blackboard symbols such as ℝ are absent from the interface
+                # font. Prefer the system's sans symbol face at the same size.
+                symbol_font = QFont(ui_font)
+                symbol_font.setFamily("Segoe UI Symbol")
+                symbol_key = (symbol_font.toString(), self.parent().logicalDpiY())
+                if symbol_key not in self.font_cache:
+                    self.font_cache[symbol_key] = QRawFont.fromFont(symbol_font)
+                raw_font = self.font_cache[symbol_key]
+                if not raw_font.supportsCharacter(character):
+                    fallback_key = (font.fname, size, self.parent().logicalDpiY())
+                    if fallback_key not in self.font_cache:
+                        self.font_cache[fallback_key] = QRawFont(
+                            str(font.fname), size * fallback_key[2] / 72.0)
+                    raw_font = self.font_cache[fallback_key]
+            run = QGlyphRun()
+            run.setRawFont(raw_font)
+            run.setGlyphIndexes(raw_font.glyphIndexesForString(chr(character)))
+            run.setPositions([QPointF(rectangle.left() + 1 + x, baseline - y)])
+            painter.drawGlyphRun(QPointF(0, 0), run)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(text_format.foreground())
+        for x, y, width, height in layout.rects:
+            painter.drawRect(QRectF(rectangle.left() + 1 + x, baseline - y - height, width, height))
+        painter.restore()
+
+
+class EquilibriumInfo(QTextEdit):
+    """Wrapping, selectable interface text with inline TeX mathematics."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.document().setDocumentMargin(2)
+        self.math_objects = InlineMathObject(self)
+        self.document().documentLayout().registerHandler(
+            self.math_objects.object_type, self.math_objects,
+        )
+        self.document().documentLayout().documentSizeChanged.connect(self._fit_height)
+
+    def _fit_height(self, size):
+        self.setMinimumHeight(max(80, math.ceil(size.height()) + 6))
+
+    def set_rows(self, rows, foreground):
+        self.clear()
+        self.document().setDefaultFont(self.font())
+        cursor = QTextCursor(self.document())
+        normal = QTextCharFormat()
+        normal.setFont(self.font())
+        normal.setForeground(QColor(foreground))
+        block = QTextBlockFormat()
+        block.setBottomMargin(5)
+        for index, row in enumerate(rows):
+            if index:
+                cursor.insertBlock()
+            cursor.setBlockFormat(block)
+            for segment in re.split(r"(\$[^$]*\$)", row):
+                if segment.startswith("$") and segment.endswith("$"):
+                    formula = QTextCharFormat(normal)
+                    formula.setObjectType(self.math_objects.object_type)
+                    formula.setProperty(self.math_objects.expression_property, segment[1:-1])
+                    formula.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignMiddle)
+                    cursor.insertText("\ufffc", formula)
+                else:
+                    cursor.insertText(segment, normal)
+        self.setAccessibleName("Equilibrium information")
+        self.setAccessibleDescription("\n".join(rows).replace("$", ""))
+        self._fit_height(self.document().size())
+
+    def createMimeDataFromSelection(self):
+        data = QMimeData()
+        cursor = self.textCursor()
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        parts = []
+        for position in range(start, end):
+            probe = QTextCursor(self.document())
+            probe.setPosition(position)
+            probe.movePosition(QTextCursor.MoveOperation.NextCharacter, QTextCursor.MoveMode.KeepAnchor)
+            text = probe.selectedText()
+            if text == "\ufffc":
+                text = "$" + probe.charFormat().property(self.math_objects.expression_property) + "$"
+            parts.append(text.replace("\u2029", "\n"))
+        data.setText("".join(parts))
+        return data
+
+
 class ODEFlowApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2716,8 +3329,8 @@ class ODEFlowApp(QMainWindow):
             for font_file in ("times.ttf", "timesi.ttf", "timesbd.ttf", "timesbi.ttf"):
                 QFontDatabase.addApplicationFont("C:\\Windows\\Fonts\\" + font_file)
         self.setWindowTitle("ODE Flow Lab — 2D / 3D Phase Portrait")
-        self.resize(1360, 820)
         self.setMinimumWidth(900)
+        self.resize(round(self.minimumWidth() * 1.2), 820)
 
         self.running = False
         self.fx = self.fy = None
@@ -2732,6 +3345,39 @@ class ODEFlowApp(QMainWindow):
         self._formula_history = {}
         self._equilibrium_cache_key = None
         self._equilibrium_results = []
+        self._equilibrium_sets = []
+        self._equilibrium_analysis = None
+        self._orbit_anchors = []
+        self._periodic_orbits = []
+        self._periodic_rows = []
+        self._periodic_key = None
+        self._pending_3d_key = None
+        self._display_3d_key = None
+        self._resume_3d_after_analysis = False
+        self._equilibrium_base_rows = []
+        self._equilibrium_request_key = None
+        self._equilibrium_pending_request = None
+        self._equilibrium_process = AnalysisProcess(self, timeout_ms=8000)
+        self._equilibrium_process.completed.connect(self._on_equilibrium_complete)
+        self._equilibrium_process.failed.connect(self._on_equilibrium_failed)
+        self._equilibrium_debounce = QTimer(self)
+        self._equilibrium_debounce.setSingleShot(True)
+        self._equilibrium_debounce.setInterval(300)
+        self._equilibrium_debounce.timeout.connect(self._dispatch_equilibrium_analysis)
+        self._periodic_process = AnalysisProcess(self, timeout_ms=10000)
+        self._periodic_process.completed.connect(self._on_periodic_complete)
+        self._periodic_process.failed.connect(self._on_periodic_failed)
+        self._nullcline_process = AnalysisProcess(self, timeout_ms=12000)
+        self._nullcline_process.completed.connect(self._on_nullclines_complete)
+        self._nullcline_process.failed.connect(self._on_nullclines_failed)
+        self._nullcline_key = None
+        self._nullcline_paths = []
+        self._nullcline_paths_model = None
+        self._nullcline_pending_request = None
+        self._nullcline_debounce = QTimer(self)
+        self._nullcline_debounce.setSingleShot(True)
+        self._nullcline_debounce.setInterval(200)
+        self._nullcline_debounce.timeout.connect(self._dispatch_nullcline_analysis)
         self._selected_solution = None
         self._parameter_editors = {}
         self._initial_states = {"2D": (1.0, 0.0, 0.0), "3D": (0.1, 0.0, 0.0)}
@@ -2757,6 +3403,10 @@ class ODEFlowApp(QMainWindow):
         self._static_refresh_timer.setSingleShot(True)
         self._static_refresh_timer.setInterval(140)
         self._static_refresh_timer.timeout.connect(self._refresh_static_background)
+        self._view_settle_timer = QTimer(self)
+        self._view_settle_timer.setSingleShot(True)
+        self._view_settle_timer.setInterval(110)
+        self._view_settle_timer.timeout.connect(self._finish_view_interaction)
 
         self.build_ui()
         QTimer.singleShot(0, self.apply_model)
@@ -2786,11 +3436,14 @@ class ODEFlowApp(QMainWindow):
 
         eq_box = QGroupBox("Differential equations")
         eq_form = QFormLayout(eq_box)
-        self.dimension_selector = QComboBox()
+        self.dimension_selector = PopupComboBox()
         self.dimension_selector.addItems(["2D", "3D"])
         self.dimension_selector.currentTextChanged.connect(self._on_dimension_changed)
-        eq_form.addRow("Dimension", self.dimension_selector)
-        self.coordinate_selector = QComboBox()
+        coordinate_controls = QHBoxLayout()
+        coordinate_controls.setSpacing(5)
+        coordinate_controls.addWidget(QLabel("Dimension"))
+        coordinate_controls.addWidget(self.dimension_selector)
+        self.coordinate_selector = PopupComboBox()
         self.coordinate_selector.addItems(["Cartesian", "Polar"])
         self.coordinate_selector.setToolTip(
             "Polar input: dr/dt and dθ/dt. The plot remains in x,y.\n"
@@ -2804,21 +3457,23 @@ class ODEFlowApp(QMainWindow):
         coordinate_layout = QHBoxLayout(self._coordinate_row)
         coordinate_layout.setContentsMargins(0, 0, 0, 0)
         coordinate_layout.setSpacing(4)
+        coordinate_layout.addWidget(self._coordinate_label)
         coordinate_layout.addWidget(self.coordinate_selector, 1)
+        coordinate_controls.addWidget(self._coordinate_row, 1)
+        eq_form.addRow(coordinate_controls)
         self.to_cartesian_btn = QPushButton("To Cartesian")
         self.to_cartesian_btn.setToolTip("Convert the current polar equations into editable dx/dt and dy/dt formulas.")
         self.to_cartesian_btn.clicked.connect(self._convert_polar_to_cartesian)
         self.to_cartesian_btn.hide()
-        coordinate_layout.addWidget(self.to_cartesian_btn)
-        eq_form.addRow(self._coordinate_label, self._coordinate_row)
-        self.model_selector = QComboBox()
+        eq_form.addRow(self.to_cartesian_btn)
+        self.model_selector = PopupComboBox()
         self.model_selector.addItem("Custom")
         self.model_selector.addItems(ODE_MODEL_PRESETS)
         self.model_selector.currentTextChanged.connect(self._on_model_selected)
         eq_form.addRow("Model", self.model_selector)
-        self.fx_input = QLineEdit(format_formula_input("x^3 - 2*x*y^2"))
-        self.fy_input = QLineEdit(format_formula_input("2*x^2*y - y^3"))
-        self.fz_input = QLineEdit()
+        self.fx_input = NotationLineEdit(format_formula_input("x^3 - 2*x*y^2"))
+        self.fy_input = NotationLineEdit(format_formula_input("2*x^2*y - y^3"))
+        self.fz_input = NotationLineEdit()
         self.fx_input.setPlaceholderText("e.g. x^2 - y")
         self.fy_input.setPlaceholderText("e.g. x + y^2")
         self._active_formula_editor = self.fx_input
@@ -2843,8 +3498,7 @@ class ODEFlowApp(QMainWindow):
         keypad_layout.setVerticalSpacing(3)
         symbols = [
             ("x", "x"), ("y", "y"), ("z", "z"), ("a", "a"), ("b", "b"),
-            ("α", "α"), ("β", "β"), ("γ", "γ"),
-            ("^", "^"), ("(", "("), (")", ")"), ("π", "pi"),
+            ("^", "^"), ("(", "("), (")", ")"),
             ("sin", "sin("), ("cos", "cos("), ("tan", "tan("),
             ("exp", "exp("), ("sqrt", "sqrt("), ("log", "log("),
         ]
@@ -2856,18 +3510,54 @@ class ODEFlowApp(QMainWindow):
             btn.clicked.connect(lambda checked=False, button=btn: self.insert_symbol(button.property("insertValue")))
             if value in ("x", "y", "z"):
                 self._coordinate_keys[value] = btn
-            keypad_layout.addWidget(btn, i // 6, i % 6)
+            keypad_layout.addWidget(btn, i // 7, i % 7)
+        self.greek_toggle = QToolButton()
+        self.greek_toggle.setText("Greek letters")
+        self.greek_toggle.setCheckable(True)
+        self.greek_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.greek_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.greek_toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.greek_toggle.setToolTip("Show or hide the 24 lowercase Greek letters.")
+        keypad_layout.addWidget(self.greek_toggle, 2, 0, 1, 7)
+        self.greek_panel = QWidget()
+        greek_layout = QGridLayout(self.greek_panel)
+        greek_layout.setContentsMargins(0, 2, 0, 0)
+        greek_layout.setHorizontalSpacing(3)
+        greek_layout.setVerticalSpacing(3)
+        self._greek_buttons = {}
+        for i, symbol in enumerate("αβγδεζηθικλμνξοπρστυφχψω"):
+            button = QPushButton(symbol)
+            button.setMaximumHeight(25)
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            value = "pi" if symbol == "π" else symbol
+            button.setProperty("insertValue", value)
+            button.clicked.connect(lambda checked=False, value=value: self.insert_symbol(value))
+            greek_layout.addWidget(button, i // 12, i % 12)
+            self._greek_buttons[symbol] = button
+        self.greek_panel.hide()
+        keypad_layout.addWidget(self.greek_panel, 3, 0, 1, 7)
+        self.greek_toggle.toggled.connect(self._toggle_greek_letters)
         controls.addWidget(keypad)
 
-        param_row = QHBoxLayout()
-        param_row.setSpacing(8)
-        param_label = QLabel("Params")
-        param_label.setMinimumWidth(48)
-        param_row.addWidget(param_label)
-        self.param_input = QLineEdit()
+        self.parameter_box = QGroupBox("Params")
+        parameter_layout = QVBoxLayout(self.parameter_box)
+        parameter_layout.setSpacing(4)
+        self.param_input = NotationLineEdit()
+        self.param_input.setPlaceholderText("e.g. α=1, β=2")
+        self.param_input.setToolTip("Define parameters as symbol=value pairs. Edit individual values below.")
         self.param_input.textChanged.connect(self._on_parameters_edited)
-        param_row.addWidget(self.param_input, 1)
-        controls.addLayout(param_row)
+        parameter_layout.addWidget(self.param_input)
+        self.parameter_fields = QWidget()
+        self.parameter_form = QGridLayout(self.parameter_fields)
+        self.parameter_form.setContentsMargins(0, 0, 0, 0)
+        self.parameter_form.setHorizontalSpacing(6)
+        self.parameter_form.setVerticalSpacing(4)
+        self.parameter_form.setColumnStretch(1, 1)
+        self.parameter_form.setColumnStretch(3, 1)
+        self.parameter_fields.hide()
+        parameter_layout.addWidget(self.parameter_fields)
+        controls.addWidget(self.parameter_box)
 
         settings = QGroupBox("View and motion")
         form = QGridLayout(settings)
@@ -2910,6 +3600,12 @@ class ODEFlowApp(QMainWindow):
         self._add_2d_setting(form, "Respawn cycle", 4, 0, 1, 2)
         form.addWidget(self.respawn_period, 4, 2, 1, 2)
         self._two_d_only_widgets.append(self.respawn_period)
+        self.first_quadrant = QCheckBox("1st quadrant")
+        self.first_quadrant.setToolTip(
+            "Show x ≥ 0 and y ≥ 0, with the origin at the lower left. Zoom remains available.")
+        self.first_quadrant.toggled.connect(self._on_first_quadrant_changed)
+        form.addWidget(self.first_quadrant, 5, 0, 1, 4)
+        self._two_d_only_widgets.append(self.first_quadrant)
 
         self.dt = self.make_spin(0.01, 0.001, 0.5, 0.005)
         self.dt.setToolTip("Positive integration step. Minimum: 0.001 with three decimal places.")
@@ -2927,7 +3623,8 @@ class ODEFlowApp(QMainWindow):
         self.normalize.setToolTip("Move along F/|F|. Preserves flow direction, but not original equation time.\nSelected initial-value solutions always use the original field F.")
         self._two_d_only_widgets.extend((self.show_field, self.normalize))
         self.show_equilibria = QCheckBox("Show equilibria")
-        self.show_equilibria.setToolTip("Mark detected equilibrium points in orange on the phase plot.")
+        self.show_equilibria.setToolTip(
+            "Equilibria in red; numerically detected limit cycles and representative closed orbits in magenta (2D).")
         self.show_equilibria.setChecked(False)
         self.show_equilibria.toggled.connect(self._on_equilibrium_visibility_changed)
         self.normalize.setChecked(True)
@@ -2937,6 +3634,13 @@ class ODEFlowApp(QMainWindow):
             "Unit speed changes particle motion, not this magnitude."
         )
         self.dark_mode_check = QCheckBox("Dark mode")
+        self.show_nullclines = QCheckBox("Show nullclines")
+        self.show_nullclines.setToolTip(
+            "2D nullclines: dx/dt = 0 in orange; dy/dt = 0 in green.\n"
+            "A component that is zero throughout the sampled view shades that region."
+        )
+        self._two_d_only_widgets.append(self.show_nullclines)
+        self.show_nullclines.toggled.connect(lambda _value: self._static_refresh_timer.start(80))
         self.particle_count.valueChanged.connect(lambda _value: self._update_flow_runtime())
         self.trail_length.valueChanged.connect(lambda _value: self._update_flow_runtime())
         self.respawn_period.valueChanged.connect(lambda _value: self._update_flow_runtime())
@@ -2958,6 +3662,11 @@ class ODEFlowApp(QMainWindow):
         visual_options.addWidget(self.speed_color)
         visual_options.addWidget(self.dark_mode_check)
         controls.addLayout(visual_options)
+        equilibrium_options = QHBoxLayout()
+        equilibrium_options.setSpacing(12)
+        equilibrium_options.addWidget(self.show_equilibria)
+        equilibrium_options.addWidget(self.show_nullclines)
+        controls.addLayout(equilibrium_options)
 
         buttons = QGridLayout()
         self.start_btn = QPushButton("Start")
@@ -2967,7 +3676,7 @@ class ODEFlowApp(QMainWindow):
         self.clear_btn.setToolTip("Clear animated flow only; keep the selected initial-value trajectory.")
         self.clear_btn.clicked.connect(self.clear_trails)
         buttons.addWidget(self.clear_btn, 1, 0, 1, 2)
-        self.reset_view_btn = QPushButton("Reset view · 10 × 10")
+        self.reset_view_btn = QPushButton("Reset view (10 × 10)")
         self.reset_view_btn.clicked.connect(self.reset_view)
         self.center_view_btn = QPushButton("Center origin")
         self.center_view_btn.setToolTip("Center the view at (0, 0) while preserving its current width and height.")
@@ -2983,7 +3692,7 @@ class ODEFlowApp(QMainWindow):
         self._action_buttons = buttons
         controls.addLayout(buttons)
 
-        self.status = QLabel("Ready · equations update as you edit")
+        self.status = QLabel("Ready. Equations update as you edit.")
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color: #666666; padding: 5px 2px;")
         controls.addWidget(self.status)
@@ -3002,39 +3711,49 @@ class ODEFlowApp(QMainWindow):
         self.view_stack.addWidget(self.flow_canvas)
         self.canvas3d = Flow3DCanvas()
         self.view_stack.addWidget(self.canvas3d)
+        self.phase_zoom_controls = QWidget(self.view_stack)
+        zoom_layout = QHBoxLayout(self.phase_zoom_controls)
+        zoom_layout.setContentsMargins(0, 0, 0, 0)
+        zoom_layout.setSpacing(4)
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_out_btn = QPushButton("−")
+        for button, label, factor in ((self.zoom_in_btn, "Zoom in", 0.8),
+                                      (self.zoom_out_btn, "Zoom out", 1.25)):
+            button.setFixedSize(32, 30)
+            button.setToolTip(label)
+            button.setAccessibleName(label)
+            button.clicked.connect(lambda _checked=False, scale=factor: self._zoom_phase_view(scale))
+            zoom_layout.addWidget(button)
+        self.phase_zoom_controls.adjustSize()
+        self.view_stack.installEventFilter(self)
+        self.view_stack.currentChanged.connect(lambda _index: self.phase_zoom_controls.raise_())
         self.right_tabs = QTabWidget()
         phase_page = QWidget()
         phase_layout = QVBoxLayout(phase_page)
         phase_layout.setContentsMargins(0, 0, 0, 0)
-        phase_header = QHBoxLayout()
-        phase_header.addWidget(self.show_equilibria)
-        self.phase_hint = QLabel("Click: select only · outside: dismiss · drag: pan · scroll: zoom")
-        self.phase_hint.setWordWrap(True)
-        phase_header.addWidget(self.phase_hint, 1)
-        phase_layout.addLayout(phase_header)
         phase_layout.addWidget(self.view_stack, 1)
         self.speed_legend = QLabel()
         self.speed_legend.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.speed_legend.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.speed_legend.setMinimumWidth(0)
         self.speed_legend.setFixedHeight(44)
         self.speed_legend.hide()
         phase_layout.addWidget(self.speed_legend)
         self.right_tabs.addTab(phase_page, "Phase portrait")
         self._build_experience_tabs()
         plot_layout.addWidget(self.right_tabs, 1)
-        equilibrium_box = QGroupBox("Equilibria · local stability")
+        equilibrium_box = QGroupBox("Equilibria and local stability")
+        equilibrium_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         equilibrium_layout = QVBoxLayout(equilibrium_box)
         equilibrium_layout.setContentsMargins(8, 7, 8, 7)
-        self.equilibrium_info = QLabel("Apply a system to find its equilibrium points.")
-        self.equilibrium_info.setWordWrap(True)
-        self.equilibrium_info.setTextFormat(Qt.TextFormat.RichText)
-        self.equilibrium_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.equilibrium_info = EquilibriumInfo()
+        self.equilibrium_info.setPlainText("Apply a system to find its equilibrium points.")
         self.equilibrium_info.setMinimumHeight(80)
         self.equilibrium_info.setStyleSheet("padding: 3px 2px;")
         self.equilibrium_scroll = QScrollArea()
         self.equilibrium_scroll.setWidgetResizable(True)
         self.equilibrium_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.equilibrium_scroll.setMinimumHeight(94)
-        self.equilibrium_scroll.setMaximumHeight(190)
+        self.equilibrium_scroll.setFixedHeight(94)
         self.equilibrium_scroll.setWidget(self.equilibrium_info)
         equilibrium_layout.addWidget(self.equilibrium_scroll)
         plot_layout.addWidget(equilibrium_box)
@@ -3057,9 +3776,15 @@ class ODEFlowApp(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(10, 10, 10, 10)
-        initial_box = QGroupBox("Initial-value solution · original equation time")
+        initial_box = QGroupBox("Initial-value solution (original equation time)")
         form = QGridLayout(initial_box)
         self.initial_spins = [self.make_spin(value, -1e6, 1e6, 0.1) for value in (1, 0, 0)]
+        for spin in self.initial_spins:
+            # Clicked coordinates must not be rounded onto an equilibrium.
+            # Keep the extra precision only for initial coordinates.
+            spin.setDecimals(12)
+            spin.setProperty("compactDecimals", True)
+            spin.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.initial_labels = [QLabel(value) for value in ("x₀", "y₀", "z₀")]
         for column, (label, spin) in enumerate(zip(self.initial_labels, self.initial_spins)):
             form.addWidget(label, 0, column * 2)
@@ -3083,7 +3808,7 @@ class ODEFlowApp(QMainWindow):
         self.time_figure = Figure(figsize=(7, 4), dpi=100)
         self.time_canvas = FigureCanvasQTAgg(self.time_figure)
         layout.addWidget(self.time_canvas, 1)
-        self.right_tabs.addTab(page, "Initial point · time")
+        self.right_tabs.addTab(page, "Flow")
         self.initial_labels[2].hide()
         self.initial_spins[2].hide()
 
@@ -3094,14 +3819,7 @@ class ODEFlowApp(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
         content_layout = QVBoxLayout(content)
-        self.parameter_box = QGroupBox("Parameters")
-        self.parameter_form = QFormLayout(self.parameter_box)
-        content_layout.addWidget(self.parameter_box)
-        self.parameter_note = QLabel("No parameters in this model. Params on the left accepts symbol=value pairs.")
-        self.parameter_note.setWordWrap(True)
-        content_layout.addWidget(self.parameter_note)
-
-        colors = QGroupBox("Speed spectrum · original |F|, log(1 + |F|)")
+        colors = QGroupBox("Speed spectrum")
         form = QFormLayout(colors)
         self.fixed_colors = QCheckBox("Use fixed color range")
         self.color_max = self.make_spin(10, 0.001, 1e9, 1)
@@ -3132,7 +3850,7 @@ class ODEFlowApp(QMainWindow):
         content_layout.addStretch()
         scroll.setWidget(content)
         layout.addWidget(scroll)
-        self.right_tabs.addTab(page, "Parameters · files")
+        self.right_tabs.addTab(page, "Others settings and files")
 
     def _solution_signature(self):
         fields = (self.fx, self.fy) if self._dimension == "2D" else (self.fx, self.fy, self.fz)
@@ -3144,7 +3862,7 @@ class ODEFlowApp(QMainWindow):
     def _invalidate_selected_solution(self, *_args):
         if self._selected_solution is not None:
             self._selected_solution = None
-            self.solution_status.setText("Settings changed · Trace solution to recalculate.")
+            self.solution_status.setText("Settings changed. Trace solution to recalculate.")
             self._draw_time_series()
             self._static_refresh_timer.start(80)
 
@@ -3174,7 +3892,7 @@ class ODEFlowApp(QMainWindow):
             spin.setValue(value)
             del blocker
         self._initial_states["2D"] = tuple(spin.value() for spin in self.initial_spins)
-        self.trace_solution()
+        self.trace_solution(focus_short_trace=True)
 
     def _trace_from_controls(self, *_args):
         self.stop_animation()
@@ -3199,7 +3917,38 @@ class ODEFlowApp(QMainWindow):
             self._invalidate_selected_solution()
         self._sync_parameter_fields()
 
-    def trace_solution(self, *_args, apply_pending=True):
+    def _focus_short_trace(self, points, plot_scale):
+        if self._dimension != "2D" or len(points) < 2 or plot_scale is None:
+            return False
+        spread = np.ptp(points[:, :2], axis=0)
+        roundoff = 64 * np.finfo(float).eps * max(1.0, float(np.max(np.abs(points))))
+        if np.max(spread) <= roundoff or np.max(spread * plot_scale) >= 8:
+            return False
+        lower, upper = points[:, :2].min(axis=0), points[:, :2].max(axis=0)
+        # Include a nearby equilibrium as spatial context, without appending it
+        # to the trajectory or pretending it is reached in finite equation time.
+        if self._equilibrium_results:
+            nearby = min((point[:2] for point, _ in self._equilibrium_results),
+                         key=lambda point: np.linalg.norm((point - points[0, :2]) * plot_scale))
+            if np.linalg.norm((nearby - points[0, :2]) * plot_scale) <= 40:
+                lower, upper = np.minimum(lower, nearby), np.maximum(upper, nearby)
+        xmin, xmax, ymin, ymax = self.flow_canvas.bounds
+        current_size = np.array([xmax-xmin, ymax-ymin])
+        if self.first_quadrant.isChecked():
+            lower = np.zeros(2)
+        # Automatic focusing stops at a 1 × 1 window. Manual zoom may go
+        # closer, but subsequent clicks must not shrink that view further.
+        desired_size = np.maximum((upper-lower) * 1.5, 1.0)
+        zoom = min(current_size / desired_size)
+        if zoom <= 1:
+            return False
+        size = current_size / zoom
+        center = (lower+upper) / 2
+        self._set_view_bounds((center[0]-size[0]/2, center[0]+size[0]/2,
+                               center[1]-size[1]/2, center[1]+size[1]/2))
+        return True
+
+    def trace_solution(self, *_args, apply_pending=True, focus_short_trace=False):
         pending = self._auto_apply_timer.isActive()
         self._auto_apply_timer.stop()
         try:
@@ -3209,6 +3958,10 @@ class ODEFlowApp(QMainWindow):
             if not self._last_apply_valid:
                 return
             fields = (self.fx, self.fy) if self._dimension == "2D" else (self.fx, self.fy, self.fz)
+            if self._dimension == "3D" and self._pending_3d_key is not None:
+                self._periodic_process.cancel()
+                self._pending_3d_key = None
+                self._resume_3d_after_analysis = False
             initial = [spin.value() for spin in self.initial_spins[:len(fields)]]
             plot_scale = None
             if self._dimension == "2D":
@@ -3227,9 +3980,11 @@ class ODEFlowApp(QMainWindow):
             self._selected_solution = {
                 "times": times, "points": points, "reason": reason,
                 "velocities": np.asarray([_field_vector(fields, point, self.params) for point in points]),
-                "signature": self._solution_signature(), "experiment": self.experiment_data(),
+                "signature": self._solution_signature(),
             }
-            self.solution_status.setText(f"{reason} · t = {times[0]:g} to {times[-1]:g} · {len(times)} samples\nOriginal equation time; adaptive integration with relative tolerance 10⁻⁷.")
+            focused = focus_short_trace and self._focus_short_trace(points, plot_scale)
+            self._selected_solution["experiment"] = self.experiment_data()
+            self.solution_status.setText(f"{reason}; t = {times[0]:g} to {times[-1]:g}; {len(times)} samples\nOriginal equation time; adaptive integration with relative tolerance 10⁻⁷.")
             self._draw_time_series()
             if self._dimension == "3D" and self.show_selected.isChecked():
                 speeds = np.array([np.linalg.norm(_field_vector(fields, p, self.params)) for p in points])
@@ -3237,13 +3992,18 @@ class ODEFlowApp(QMainWindow):
                     self.dark_mode_check.isChecked(), self.speed_color.isChecked(), self.speed.value(),
                     self.color_max.value() if self.fixed_colors.isChecked() else None,
                     (points, speeds, reason))
+                self._display_3d_key = self._trajectory3d_key()
+                self._model_applied = True
+                self.status.setText("Selected 3D trajectory ready.")
                 self._update_speed_legend()
             else:
                 self._static_refresh_timer.start(20)
+            if focused:
+                self.status.setText("Local view focused. Increase End time to follow the trajectory further.")
         except Exception as exc:
             self._invalidate_selected_solution()
-            self.solution_status.setText(f"Solution unavailable · {exc}")
-            self.status.setText(f"Solution unavailable · {exc}")
+            self.solution_status.setText(f"Solution unavailable: {exc}")
+            self.status.setText(f"Solution unavailable: {exc}")
 
     def _on_selected_visibility_changed(self, *_args):
         if self._dimension == "2D":
@@ -3266,7 +4026,7 @@ class ODEFlowApp(QMainWindow):
         ax.tick_params(colors=foreground)
         for spine in ax.spines.values():
             spine.set_color(foreground)
-        ax.set_xlabel("t · original equation time", color=foreground, fontfamily="Times New Roman")
+        ax.set_xlabel("t (original equation time)", color=foreground, fontfamily="Times New Roman")
         ax.set_ylabel("State", color=foreground, fontfamily="Times New Roman")
         ax.grid(alpha=0.15, color=foreground)
         if self._selected_solution is not None:
@@ -3289,25 +4049,35 @@ class ODEFlowApp(QMainWindow):
     def _sync_parameter_fields(self):
         # Preserve focus and unfinished text while editing an individual parameter.
         if set(self._parameter_editors) != set(self.params):
-            while self.parameter_form.rowCount():
-                self.parameter_form.removeRow(0)
+            while self.parameter_form.count():
+                item = self.parameter_form.takeAt(0)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
             self._parameter_editors = {}
-            for name in self.params:
+            for index, name in enumerate(self.params):
                 editor = QLineEdit()
-                editor.setMaximumWidth(240)
+                editor.setMinimumWidth(0)
+                editor.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
                 editor.setToolTip("Finite numeric value; Enter or leave the field to apply. Mouse wheel does not edit it.")
                 editor.editingFinished.connect(lambda symbol=name: self._commit_parameter_field(symbol))
-                label = QLabel(format_formula_input(name))
+                label = QLabel()
+                rendered_name = display_parameter_name(name, FUNCTIONS)
+                rendered_name = re.sub(
+                    r"([A-Za-zΑ-Ωα-ω]+)_([A-Za-zΑ-Ωα-ω0-9]+)",
+                    lambda m: html.escape(m[1]) + "<sub>" + html.escape(m[2]) + "</sub>",
+                    rendered_name)
+                label.setText(rendered_name)
                 label.setStyleSheet("font-family:Times New Roman; font-size:12pt;")
-                self.parameter_form.addRow(label, editor)
+                row, column = index // 2, (index % 2) * 2
+                self.parameter_form.addWidget(label, row, column)
+                self.parameter_form.addWidget(editor, row, column + 1)
                 self._parameter_editors[name] = editor
         for name, editor in self._parameter_editors.items():
             if not editor.hasFocus():
                 # Keep extra digits only when the raw Params value actually has them;
                 # never display a rounded value while calculating another value.
                 editor.setText(format(self.params[name], ".12g"))
-        self.parameter_note.setText("Edit a symbol here, or use Params on the left for symbol=value pairs."
-                                    if self.params else "No parameters in this model.")
+        self.parameter_fields.setVisible(bool(self.params))
 
     def _commit_parameter_field(self, name):
         if name not in self._parameter_editors:
@@ -3318,14 +4088,14 @@ class ODEFlowApp(QMainWindow):
             if not np.isfinite(value):
                 raise ValueError("Value must be finite.")
             value = round(value, 3)
-            params = parse_parameters(self.param_input.text())
-            if name not in params:
-                return
+            params = dict(self.params)
             params[name] = value
             editor.setText(f"{value:.3f}")
-            self.param_input.setText(", ".join(f"{symbol}={format(number, '.12g')}" for symbol, number in params.items()))
+            self.param_input.setText(", ".join(
+                f"{display_parameter_name(symbol)}={format(number, '.12g')}"
+                for symbol, number in params.items()))
         except Exception as exc:
-            self.status.setText(f"Parameter {name} · {exc}")
+            self.status.setText(f"Parameter {name}: {exc}")
 
     def _on_color_range_changed(self, *_args):
         if self._loading_experiment:
@@ -3343,7 +4113,7 @@ class ODEFlowApp(QMainWindow):
         self.canvas3d.set_equilibrium_points(self._equilibrium_results, self.show_equilibria.isChecked())
         self._update_speed_legend()
 
-    def _update_speed_legend(self):
+    def _update_speed_legend(self, plot_rect=None):
         enabled = self.speed_color.isChecked()
         self.speed_legend.setVisible(enabled)
         if not enabled:
@@ -3354,21 +4124,34 @@ class ODEFlowApp(QMainWindow):
         if self.fixed_colors.isChecked():
             maximum = self.color_max.value()
         dark = self.dark_mode_check.isChecked()
-        signature = (float(maximum), dark, self.fixed_colors.isChecked())
+        if self._dimension == "2D":
+            left, right = (plot_rect or self.flow_canvas.plot_rect)[:2]
+        else:
+            left, _, plot_width, _ = self.canvas3d.ax.get_position().bounds
+            right = left + plot_width
+        width = max(1, self.speed_legend.width())
+        height = self.speed_legend.height()
+        ratio = self.speed_legend.devicePixelRatioF()
+        signature = (float(maximum), dark, self.fixed_colors.isChecked(),
+                     self._dimension, width, height, ratio, left, right)
         if getattr(self, "_speed_legend_signature", None) == signature:
             return
         bg, fg = ("#000000", "#eeeeee") if dark else ("#ffffff", "#111111")
-        figure = Figure(figsize=(5.0, 0.4), dpi=110, facecolor=bg)
-        ax = figure.add_axes((0.05, 0.66, 0.9, 0.26))
+        physical_size = self.speed_legend.size() * ratio
+        dpi = 110 * ratio
+        figure = Figure(figsize=(physical_size.width() / dpi, physical_size.height() / dpi),
+                        dpi=dpi, facecolor=bg)
+        ax = figure.add_axes((left, 0.66, right - left, 0.26))
         from matplotlib.colorbar import ColorbarBase
         bar = ColorbarBase(ax, cmap=speed_colormap(), norm=speed_normalization(maximum), orientation="horizontal")
+        bar.outline.set_visible(False)
         bar.set_ticks([0, np.expm1(np.log1p(maximum)/2), maximum])
         ax.tick_params(colors=fg, labelsize=8, length=2, pad=1)
-        label = "fixed" if self.fixed_colors.isChecked() else "auto"
-        bar.set_label(f"|F| · log(1 + |F|) · {label} · values above maximum saturated", color=fg, fontsize=8, labelpad=0)
         output = io.BytesIO()
         FigureCanvasAgg(figure).print_png(output)
-        self.speed_legend.setPixmap(QPixmap.fromImage(QImage.fromData(output.getvalue())))
+        pixmap = QPixmap.fromImage(QImage.fromData(output.getvalue()))
+        pixmap.setDevicePixelRatio(ratio)
+        self.speed_legend.setPixmap(pixmap)
         self._speed_legend_signature = signature
         figure.clear()
 
@@ -3391,6 +4174,8 @@ class ODEFlowApp(QMainWindow):
                 "normalized": self.normalize.isChecked(), "speed_colors": self.speed_color.isChecked(),
                 "dark": self.dark_mode_check.isChecked(), "vectors": self.show_field.isChecked(),
                 "equilibria": self.show_equilibria.isChecked(), "fixed_colors": self.fixed_colors.isChecked(),
+                "nullclines": self.show_nullclines.isChecked(),
+                "first_quadrant": self.first_quadrant.isChecked(),
                 "show_selected": self.show_selected.isChecked(),
             },
         }
@@ -3399,8 +4184,8 @@ class ODEFlowApp(QMainWindow):
         key = "3D" if data["dimension"] == "3D" else (
             "Polar" if data["coordinates"] == "Polar" else "2D")
         state = data["modes"][key]
-        params = parse_parameters(state[4])
         texts = state[1:4] if key == "3D" else state[1:3]
+        params = parameters_for_equations(texts, state[4], key == "Polar")
         fields = [compile_formula(text, params) for text in texts]
         if key == "Polar":
             if {"r", "θ", "theta"}.intersection(params):
@@ -3419,7 +4204,7 @@ class ODEFlowApp(QMainWindow):
             Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             self.status.setText("Experiment saved.")
         except Exception as exc:
-            self.status.setText(f"Save failed · {exc}")
+            self.status.setText(f"Save failed: {exc}")
 
     def load_experiment(self, *_args):
         path, _ = QFileDialog.getOpenFileName(self, "Load experiment", "", "Experiment (*.json)")
@@ -3433,14 +4218,31 @@ class ODEFlowApp(QMainWindow):
             # equations before changing the UI; drafts are checked when opened.
             self._validate_experiment_equations(data)
             self._restore_experiment(data)
-            self.status.setText("Experiment loaded · paused.")
+            self.status.setText("Experiment loaded. Paused.")
         except Exception as exc:
-            self.status.setText(f"Load failed · {exc}")
+            self.status.setText(f"Load failed: {exc}")
 
     def _restore_experiment(self, data):
         self.stop_animation()
+        self._equilibrium_debounce.stop()
+        self._equilibrium_process.cancel()
+        self._equilibrium_pending_request = None
+        self._equilibrium_request_key = None
+        self._periodic_process.cancel()
+        self._pending_3d_key = None
+        self._resume_3d_after_analysis = False
+        self._periodic_key = None
+        self._periodic_orbits = []
+        self._periodic_rows = []
+        self._nullcline_debounce.stop()
+        self._nullcline_process.cancel()
+        self._nullcline_key = None
+        self._nullcline_pending_request = None
+        self._nullcline_paths = []
+        self._nullcline_paths_model = None
         self._auto_apply_timer.stop()
         self._static_refresh_timer.stop()
+        self._view_settle_timer.stop()
         self._loading_experiment = True
         self._updating_model_inputs = True
         controls = [self.dimension_selector, self.coordinate_selector, self.model_selector,
@@ -3448,7 +4250,7 @@ class ODEFlowApp(QMainWindow):
                     *self.initial_spins, self.duration, self.color_max, self.fixed_colors,
                     self.particle_count, self.trail_length, self.respawn_period, self.dt, self.speed,
                     self.normalize, self.speed_color, self.dark_mode_check, self.show_field,
-                    self.show_equilibria, self.show_selected]
+                    self.show_equilibria, self.show_nullclines, self.show_selected, self.first_quadrant]
         blockers = [QSignalBlocker(widget) for widget in controls]
         try:
             self._mode_states = {key: tuple(value) for key, value in data["modes"].items()}
@@ -3477,12 +4279,16 @@ class ODEFlowApp(QMainWindow):
                                  ("equilibria", self.show_equilibria), ("fixed_colors", self.fixed_colors),
                                  ("show_selected", self.show_selected)):
                 widget.setChecked(settings[name])
+            self.show_nullclines.setChecked(settings.get("nullclines", False))
+            self.first_quadrant.setChecked(settings.get("first_quadrant", False))
+            self._update_quadrant_controls()
             for spin, value in zip(self.initial_spins, data["initial"]):
                 spin.setValue(value)
             self._initial_states[self._dimension] = tuple(data["initial"])
             self._selected_solution = None
             self._equilibrium_cache_key = None
             self._equilibrium_results = []
+            self._equilibrium_sets = []
             self._set_equilibrium_message("Loading experiment…")
             self._set_view_bounds(data["bounds"])
             self.color_max.setEnabled(self.fixed_colors.isChecked())
@@ -3514,7 +4320,7 @@ class ODEFlowApp(QMainWindow):
             if self._dimension == "2D":
                 if not self.flow_canvas.ready:
                     raise ValueError("The phase view is not ready.")
-                self._refresh_static_background()
+                self._refresh_static_background(final=True)
                 frame = self.flow_canvas.grabFramebuffer()
                 if frame.isNull():
                     raise ValueError("The phase view is not ready.")
@@ -3531,7 +4337,7 @@ class ODEFlowApp(QMainWindow):
                 self._update_speed_legend()
                 legend = self.speed_legend.pixmap().toImage()
                 legend.setDevicePixelRatio(1.0)
-                scale = min(frame.width() / legend.width(), frame.width() / 600)
+                scale = frame.width() / legend.width()
                 width, height = round(legend.width() * scale), round(legend.height() * scale)
                 combined = QImage(frame.width(), frame.height() + height + 8, QImage.Format.Format_RGB32)
                 combined.fill(Qt.GlobalColor.black if self.dark_mode_check.isChecked() else Qt.GlobalColor.white)
@@ -3544,7 +4350,7 @@ class ODEFlowApp(QMainWindow):
                 raise ValueError("Could not write the image.")
             self.status.setText("Phase portrait exported.")
         except Exception as exc:
-            self.status.setText(f"Export failed · {exc}")
+            self.status.setText(f"Export failed: {exc}")
 
     def export_solution_csv(self, *_args):
         if self._selected_solution is None:
@@ -3564,7 +4370,7 @@ class ODEFlowApp(QMainWindow):
                 np.savetxt(output, np.column_stack((data["times"], data["points"])), delimiter=",", fmt="%.12g")
             self.status.setText("Solution CSV exported with equation and parameter metadata.")
         except Exception as exc:
-            self.status.setText(f"Export failed · {exc}")
+            self.status.setText(f"Export failed: {exc}")
 
     def export_solution_plot(self, *_args):
         if self._selected_solution is None:
@@ -3579,7 +4385,7 @@ class ODEFlowApp(QMainWindow):
             self.time_figure.savefig(path, dpi=240, facecolor=self.time_figure.get_facecolor())
             self.status.setText("Solution plot exported.")
         except Exception as exc:
-            self.status.setText(f"Export failed · {exc}")
+            self.status.setText(f"Export failed: {exc}")
 
     @staticmethod
     def make_spin(value, minimum, maximum, step, compact_decimals=False):
@@ -3612,21 +4418,21 @@ class ODEFlowApp(QMainWindow):
                 margin-top: 6px; padding: 4px 7px 4px; font-weight: 600; color: {foreground}; }}
             QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 5px; }}
             QLabel {{ color: {secondary}; }}
-            QLineEdit, QSpinBox, QDoubleSpinBox {{ background: {background}; border: 1px solid {field_border};
+            QLineEdit, NotationLineEdit, QSpinBox, QDoubleSpinBox {{ background: {background}; border: 1px solid {field_border};
                 border-radius: 4px; padding: 3px 6px; color: {foreground}; selection-background-color: #777777; }}
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border: 1px solid {foreground}; }}
-            QPushButton {{ background: {background}; border: 1px solid {field_border}; border-radius: 4px;
+            QLineEdit:focus, NotationLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border: 1px solid {foreground}; }}
+            QPushButton, QToolButton {{ background: {background}; border: 1px solid {field_border}; border-radius: 4px;
                 padding: 4px; color: {foreground}; font-weight: 600; }}
-            QPushButton:hover {{ background: {hover}; border-color: #888888; }}
+            QPushButton:hover, QToolButton:hover {{ background: {hover}; border-color: #888888; }}
             QCheckBox {{ spacing: 8px; color: {secondary}; }}
             QCheckBox::indicator {{ width: 15px; height: 15px; }}
             QSplitter::handle {{ background: {split}; width: 1px; }}
         """)
         for editor in (self.fx_input, self.fy_input, self.fz_input):
             editor.setStyleSheet(
-                f"QLineEdit {{ background-color: {background}; border: 1px solid {field_border}; "
-                f"border-radius: 4px; padding: 4px 6px; color: {foreground}; }}"
-                f"QLineEdit:focus {{ border: 1px solid {foreground}; }}"
+                f"NotationLineEdit {{ background-color: {background}; border: 1px solid {field_border}; "
+                f"border-radius: 4px; padding: 3px 6px; color: {foreground}; }}"
+                f"NotationLineEdit:focus {{ border: 1px solid {foreground}; }}"
             )
         self.title_label.setStyleSheet(f"font-size: 21px; font-weight: 700; color: {foreground};")
         self.status.setStyleSheet(f"color: {secondary}; padding: 5px 2px;")
@@ -3655,13 +4461,18 @@ class ODEFlowApp(QMainWindow):
                 image: none; border: none; width: 0; height: 0; }}
         """)
         if getattr(self, "_equilibrium_rows", None):
-            self._render_equilibrium_rows(self._equilibrium_rows)
+            self._render_equilibrium_rows(self._equilibrium_base_rows)
         elif getattr(self, "_equilibrium_message", None):
             self._set_equilibrium_message(self._equilibrium_message)
         if hasattr(self, "time_figure"):
             self._draw_time_series()
 
     def _on_visual_options_changed(self, _checked=False):
+        if not self.show_nullclines.isChecked():
+            self._nullcline_debounce.stop()
+            self._nullcline_process.cancel()
+            self._nullcline_key = None
+            self._nullcline_pending_request = None
         dark = self.dark_mode_check.isChecked()
         self._apply_theme(dark)
         if hasattr(self, "flow_canvas"):
@@ -3672,6 +4483,15 @@ class ODEFlowApp(QMainWindow):
             self._static_refresh_timer.start(80)
 
     def _on_equilibrium_visibility_changed(self, _checked=False):
+        if (not self.show_equilibria.isChecked()
+                and (self._periodic_process.busy is not None or self._periodic_process.pending is not None)
+                and self._dimension == "2D"):
+            self._periodic_process.cancel()
+            self._periodic_key = None
+            self._periodic_orbits = []
+            self._periodic_rows = []
+            if self._equilibrium_base_rows:
+                self._render_equilibrium_rows(self._equilibrium_base_rows)
         if self._dimension == "2D":
             self._static_refresh_timer.start(80)
         elif hasattr(self, "canvas3d"):
@@ -3684,9 +4504,15 @@ class ODEFlowApp(QMainWindow):
         values = np.asarray([xmin, xmax, ymin, ymax])
         if not np.all(np.isfinite(values)) or np.max(np.abs(values)) > 1e9:
             return
+        if self._dimension == "2D" and self.first_quadrant.isChecked():
+            values = np.array([0.0, xmax-xmin, 0.0, ymax-ymin])
+            if np.max(np.abs(values)) > 1e9:
+                return
         # The view and its three-decimal controls must describe the same box.
         xmin, xmax, ymin, ymax = (round(v, 3) for v in values)
         if xmax - xmin < 0.001 or ymax - ymin < 0.001:
+            return
+        if (xmin, xmax, ymin, ymax) == getattr(self, "_active_bounds", None):
             return
         self._syncing_view = True
         blockers = [QSignalBlocker(spin) for spin in (self.xmin, self.xmax, self.ymin, self.ymax)]
@@ -3699,10 +4525,52 @@ class ODEFlowApp(QMainWindow):
         self._active_bounds = (xmin, xmax, ymin, ymax)
         if hasattr(self, "flow_canvas"):
             self.flow_canvas.set_view_bounds(self._active_bounds)
-        self._static_refresh_timer.start(130)
+        self._view_settle_timer.start()
+        # Throttle rather than debounce: moving continuously must still redraw.
+        if not self._static_refresh_timer.isActive():
+            self._static_refresh_timer.start(20)
 
     def _on_canvas_view_changed(self, xmin, xmax, ymin, ymax):
         self._set_view_bounds((xmin, xmax, ymin, ymax))
+
+    def _zoom_phase_view(self, factor):
+        if self._dimension == "2D":
+            xmin, xmax, ymin, ymax = self._active_bounds
+            cx, cy = (xmin+xmax)/2, (ymin+ymax)/2
+            self._set_view_bounds((cx+(xmin-cx)*factor, cx+(xmax-cx)*factor,
+                                   cy+(ymin-cy)*factor, cy+(ymax-cy)*factor))
+        else:
+            ax = self.canvas3d.ax
+            for getter, setter in ((ax.get_xlim3d, ax.set_xlim3d),
+                                   (ax.get_ylim3d, ax.set_ylim3d),
+                                   (ax.get_zlim3d, ax.set_zlim3d)):
+                low, high = getter()
+                center = (low+high)/2
+                setter(center+(low-center)*factor, center+(high-center)*factor)
+            self.canvas3d.canvas.draw_idle()
+
+    def _update_quadrant_controls(self):
+        active = self.first_quadrant.isChecked()
+        self.xmin.setEnabled(not active)
+        self.ymin.setEnabled(not active)
+        if self._dimension == "2D":
+            self.reset_view_btn.setText("Reset view (0–5)" if active else "Reset view (10 × 10)")
+        else:
+            self.reset_view_btn.setText("Reset 3D view")
+        self.center_view_btn.setToolTip(
+            "Place the origin at the lower left while preserving the current width and height."
+            if active else "Center the view at (0, 0) while preserving its current width and height.")
+
+    def _on_first_quadrant_changed(self, checked):
+        self._update_quadrant_controls()
+        if self._loading_experiment or self._dimension != "2D":
+            return
+        if checked:
+            xmin, xmax, ymin, ymax = self.flow_canvas.bounds
+            self._set_view_bounds((0.0, xmax if xmax > 0 else xmax-xmin,
+                                   0.0, ymax if ymax > 0 else ymax-ymin))
+        else:
+            self.center_view()
 
     def _bounds_changed_from_controls(self, _value):
         if self._syncing_view or not hasattr(self, "flow_canvas"):
@@ -3757,7 +4625,7 @@ class ODEFlowApp(QMainWindow):
             self._auto_apply_timer.stop()
             self.apply_model()
         except Exception as exc:
-            self.status.setText(f"Coordinate conversion error · {exc}")
+            self.status.setText(f"Coordinate conversion error: {exc}")
 
     def _on_coordinates_changed(self, coordinates):
         if coordinates == self._coordinates or self._dimension != "2D":
@@ -3794,23 +4662,29 @@ class ODEFlowApp(QMainWindow):
     def _on_dimension_changed(self, dimension):
         if dimension == self._dimension or not hasattr(self, "model_selector"):
             return
+        self._periodic_process.cancel()
+        self._pending_3d_key = None
+        self._resume_3d_after_analysis = False
         self._initial_states[self._dimension] = tuple(spin.value() for spin in self.initial_spins)
         self._mode_states[self._editor_state_key()] = self._read_editor_state()
         self.stop_animation()
         self._dimension = dimension
+        if dimension == "3D":
+            self._nullcline_debounce.stop()
+            self._nullcline_process.cancel()
+            self._nullcline_key = None
+            self._nullcline_pending_request = None
         self._restore_initial_controls()
         state = self._mode_states[self._editor_state_key()]
         self._refresh_model_items(dimension, state[0])
         self.view_stack.setCurrentIndex(0 if dimension == "2D" else 1)
-        self.phase_hint.setText(
-            "Click: select only · outside: dismiss · drag: pan · scroll: zoom" if dimension == "2D" else
-            "Drag: rotate · scroll: zoom · edit initial coordinates in the time tab"
-        )
         is_2d = dimension == "2D"
         for widget in self._two_d_only_widgets:
             widget.setVisible(is_2d)
         self.clear_btn.setText("Clear dynamic flow")
-        self.reset_view_btn.setText("Reset view · 10 × 10" if is_2d else "Reset 3D view")
+        self._update_quadrant_controls()
+        if is_2d and self.first_quadrant.isChecked():
+            self._set_view_bounds(self.flow_canvas.bounds)
         self._action_buttons.removeWidget(self.reset_view_btn)
         self._action_buttons.addWidget(self.reset_view_btn, 2, 0, 1, 1 if is_2d else 2)
         for widget in (self._fz_label, self.fz_input):
@@ -3895,13 +4769,27 @@ class ODEFlowApp(QMainWindow):
         if parameter_text is None:
             return set()
         names = set()
-        for item in parameter_text.text().split(","):
+        for item in normalize_display_expression(parameter_text.text()).split(","):
             match = re.match(r"\s*([^=,\s]+)\s*=", item)
             if match and match.group(1).isidentifier():
                 names.add(match.group(1))
-        return names
+        reserved = set(FUNCTIONS) | {"x", "y", "z", "pi", "e"}
+        if self._editor_state_key() == "Polar":
+            reserved |= {"r", "θ", "theta"}
+        expressions = [self.fx_input.text(), self.fy_input.text()]
+        if self._dimension == "3D":
+            expressions.append(self.fz_input.text())
+        return infer_parameter_names(
+            [normalize_display_expression(text) for text in expressions], names, reserved)
 
     def eventFilter(self, watched, event):
+        if (watched is getattr(self, "view_stack", None)
+                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
+            controls = self.phase_zoom_controls
+            controls.move(max(0, watched.width()-controls.width()-12), 12)
+            controls.raise_()
+        if watched is getattr(self, "speed_legend", None) and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self._update_speed_legend)
         if event.type() == QEvent.Type.ToolTip and watched in (self.flow_canvas, self.canvas3d.canvas):
             return True
         if (event.type() == QEvent.Type.MouseButtonPress
@@ -3920,7 +4808,9 @@ class ODEFlowApp(QMainWindow):
             on_tab_bar = tab_bar.rect().contains(tab_bar.mapFromGlobal(global_point))
             # The explicit visibility checkbox must keep its usual toggle
             # behavior; all other right-side clicks outside the axes dismiss.
-            if not on_controls and not on_plot and not on_tab_bar and watched is not self.show_selected:
+            on_zoom = (watched is self.phase_zoom_controls
+                       or self.phase_zoom_controls.isAncestorOf(watched))
+            if not on_controls and not on_plot and not on_tab_bar and not on_zoom and watched is not self.show_selected:
                 self._dismiss_selected_trace()
         if event.type() == QEvent.Type.FocusIn and watched in (self.fx_input, self.fy_input, self.fz_input, self.param_input):
             self._active_calculator_editor = watched
@@ -3953,6 +4843,15 @@ class ODEFlowApp(QMainWindow):
     def _on_parameters_edited(self, _text):
         if self._updating_model_inputs:
             return
+        text = self.param_input.text()
+        formatted = format_parameter_definitions(normalize_latex_symbols(text), FUNCTIONS)
+        if formatted != text:
+            cursor = len(format_parameter_definitions(
+                normalize_latex_symbols(text[:self.param_input.cursorPosition()]), FUNCTIONS))
+            blocker = QSignalBlocker(self.param_input)
+            self.param_input.setText(formatted)
+            self.param_input.setCursorPosition(min(cursor, len(formatted)))
+            del blocker
         self._invalidate_selected_solution()
         self._remember_custom_equations()
 
@@ -3967,6 +4866,10 @@ class ODEFlowApp(QMainWindow):
 
     def _apply_model_after_edit(self):
         self.apply_model()
+
+    def _toggle_greek_letters(self, expanded):
+        self.greek_panel.setVisible(expanded)
+        self.greek_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
 
     def insert_symbol(self, value):
         focused = QApplication.focusWidget()
@@ -3998,8 +4901,11 @@ class ODEFlowApp(QMainWindow):
         widget.setFocus()
 
     def read_model(self):
-        params = parse_parameters(self.param_input.text())
         polar = self._editor_state_key() == "Polar"
+        expressions = [self.fx_input.text(), self.fy_input.text()]
+        if self._dimension == "3D":
+            expressions.append(self.fz_input.text())
+        params = parameters_for_equations(expressions, self.param_input.text(), polar)
         if polar and {"r", "θ", "theta"}.intersection(params):
             raise ValueError("r and θ are coordinates in Polar mode, not parameters.")
         expressions = [self.fx_input.text(), self.fy_input.text()]
@@ -4046,20 +4952,15 @@ class ODEFlowApp(QMainWindow):
                 self.stop_animation()
             if self._dimension == "3D":
                 initial = tuple(spin.value() for spin in self.initial_spins)
-                self.canvas3d.set_model(
-                    (self.fx, self.fy, self.fz), self.params, initial,
-                    self.dt.value(), self.dark_mode_check.isChecked(),
-                    self.speed_color.isChecked(), self.speed.value(),
-                    self.color_max.value() if self.fixed_colors.isChecked() else None,
-                )
-                self._model_applied = True
-                self._update_equilibrium_info()
-                self._gpu_ready = True
-                self.status.setText(f"3D trajectory ready · {self.canvas3d.integration_status}.")
                 self._after_model_applied()
-                self._update_speed_legend()
-                if was_running:
-                    self.toggle_animation()
+                self._pending_3d_key = self._trajectory3d_key()
+                self._resume_3d_after_analysis = was_running
+                self._periodic_process.timeout_ms = 20000
+                self._periodic_process.submit(self._pending_3d_key, {
+                    "fields": (self.fx, self.fy, self.fz), "params": dict(self.params),
+                    "initial": initial, "dt": self.dt.value(),
+                }, "trajectory3d")
+                self.status.setText("Calculating 3D trajectory...")
                 return
             config = {
                 "vx": compile_glsl(self.fx, self.params),
@@ -4085,6 +4986,7 @@ class ODEFlowApp(QMainWindow):
             )
             self._model_applied = True
             self._after_model_applied()
+            self._request_periodic_orbits()
             if self.flow_canvas.ready:
                 self.status.setText("GPU particle flow ready.")
                 if was_running:
@@ -4093,9 +4995,25 @@ class ODEFlowApp(QMainWindow):
                 self.status.setText("Preparing OpenGL flow…")
         except Exception as exc:
             self.stop_animation()
+            self._equilibrium_debounce.stop()
+            self._equilibrium_process.cancel()
+            self._equilibrium_pending_request = None
+            self._equilibrium_request_key = None
+            self._nullcline_debounce.stop()
+            self._nullcline_process.cancel()
+            self._nullcline_key = None
+            self._nullcline_pending_request = None
+            self._nullcline_paths = []
+            self._periodic_process.cancel()
+            self._pending_3d_key = None
+            self._periodic_key = None
+            self._periodic_orbits = []
+            self._periodic_rows = []
             self._equilibrium_results = []
+            self._equilibrium_sets = []
+            self._orbit_anchors = []
             self._equilibrium_cache_key = None
-            self.status.setText(f"Input error · {exc}")
+            self.status.setText(f"Input error: {exc}")
             if hasattr(self, "equilibrium_info"):
                 self._set_equilibrium_message("Equilibrium analysis unavailable until the system is valid.")
 
@@ -4106,129 +5024,220 @@ class ODEFlowApp(QMainWindow):
             xmin, xmax, ymin, ymax = view_bounds or self._active_bounds
             bounds = ((xmin, xmax), (ymin, ymax))
             fields = (self.fx, self.fy)
-            search_note = "Search region: current 2D view"
+            note = "Search region: current 2D view"
         else:
             trajectory = self.canvas3d.trajectory
             if trajectory.size == 0 or self.fz is None:
-                self._set_equilibrium_message("No 3D trajectory available for equilibrium search.")
                 return
             minimum = np.minimum(trajectory.min(axis=0), 0.0)
             maximum = np.maximum(trajectory.max(axis=0), 0.0)
-            padding = np.maximum((maximum - minimum) * 0.06, 0.5)
-            bounds = np.column_stack((minimum - padding, maximum + padding))
+            padding = np.maximum((maximum-minimum)*0.06, 0.5)
+            bounds = np.column_stack((minimum-padding, maximum+padding))
             fields = (self.fx, self.fy, self.fz)
-            search_note = "Search region: 3D trajectory range"
-
-        key = (
-            self._dimension,
-            tuple(ast.dump(field, include_attributes=False) for field in fields),
-            tuple(sorted(self.params.items())),
-            tuple(np.round(np.asarray(bounds, dtype=float).ravel(), 9)),
-        )
-        if key == self._equilibrium_cache_key:
-            if self._dimension == "3D":
-                self.canvas3d.set_equilibrium_points(
-                    self._equilibrium_results, self.show_equilibria.isChecked()
-                )
+            note = "Search region: 3D trajectory range"
+        key = (self._dimension, tuple(ast.dump(field) for field in fields),
+               tuple(sorted(self.params.items())),
+               tuple(np.round(np.asarray(bounds, dtype=float).ravel(), 9)))
+        previous = self._equilibrium_request_key
+        if self._dimension == "2D" and previous is not None and key[:3] == previous[:3]:
+            searched = np.asarray(previous[3]).reshape(-1, 2)
+            requested = np.asarray(bounds)
+            # A smaller or contained view reuses both completed results and an
+            # in-flight search. Keep its key stable so a late result is accepted.
+            if np.all(requested[:, 0] >= searched[:, 0]-1e-9) and np.all(requested[:, 1] <= searched[:, 1]+1e-9):
+                return
+            # Retain coverage when panning/expanding, including the old box.
+            bounds = np.column_stack((np.minimum(requested[:, 0], searched[:, 0]),
+                                      np.maximum(requested[:, 1], searched[:, 1])))
+            key = (*key[:3], tuple(np.round(bounds.ravel(), 9)))
+        if self._dimension == "2D":
+            (xmin, xmax), (ymin, ymax) = bounds
+            note = f"Search region: x in [{xmin:g}, {xmax:g}], y in [{ymin:g}, {ymax:g}]"
+        if key == self._equilibrium_request_key:
             return
-        self._set_equilibrium_message(f"{search_note} · Searching equilibria…")
-        try:
-            x_axis_only = False
-            if self._dimension == "2D":
-                try:
-                    fy_names = {node.id for node in ast.walk(fields[1]) if isinstance(node, ast.Name)}
-                    if not fy_names.intersection({"x", "y"}):
-                        x_axis_only = float(eval_node(fields[1], self.params)) == 0.0
-                except (ArithmeticError, TypeError, ValueError, OverflowError):
-                    pass
-            if x_axis_only:
-                search_note = "Search restricted to y = 0 because dy/dt ≡ 0"
-            results = find_equilibria(fields, self.params, bounds, x_axis_only=x_axis_only)
-            self._equilibrium_results = results
-            if not results:
-                self._set_equilibrium_message(f"{search_note} · No isolated equilibrium detected.")
-            else:
-                rows = []
-                if x_axis_only:
-                    rows.append("Search restricted to y = 0; the full system may also have non-isolated equilibria away from the x-axis.")
-                for point, details in results:
-                    coordinates = ", ".join(f"{value:.5g}" for value in point)
-                    linear_result = f"{details['type']} · {details['linearization']}"
-                    hyperbolic_text = (
-                        "Hyperbolic" if details["hyperbolic"] else "Non-hyperbolic"
-                    ) if details["hyperbolic"] is not None else "Hyperbolicity unavailable"
-                    rows.append(
-                        f"Equilibrium point: $({coordinates})$    "
-                        f"$\\lambda=({details['eigenvalues']})$    "
-                        f"{hyperbolic_text}    "
-                        f"Linear result: {linear_result}"
-                    )
-            if results:
-                self._render_equilibrium_rows(rows)
-            self._equilibrium_cache_key = key
-            if self._dimension == "3D":
-                self.canvas3d.set_equilibrium_points(
-                    self._equilibrium_results, self.show_equilibria.isChecked()
-                )
-        except Exception as exc:
-            self._equilibrium_results = []
-            self._set_equilibrium_message(f"Equilibrium search unavailable: {exc}")
+        self._equilibrium_request_key = key
+        self._equilibrium_cache_key = None
+        self._equilibrium_results = []
+        self._equilibrium_sets = []
+        self._equilibrium_analysis = None
+        self._orbit_anchors = []
+        self._periodic_process.cancel()
+        self._periodic_key = None
+        self._periodic_orbits = []
+        self._periodic_rows = []
+        self._set_equilibrium_message(f"{note}. Searching equilibria...")
+        self._equilibrium_pending_request = (key, {
+            "fields": fields, "params": dict(self.params),
+            "bounds": bounds, "note": note,
+        })
+        self._equilibrium_debounce.start()
+
+    def _dispatch_equilibrium_analysis(self):
+        if self._equilibrium_pending_request is not None:
+            key, payload = self._equilibrium_pending_request
+            self._equilibrium_pending_request = None
+            self._equilibrium_process.submit(key, payload)
+
+    def _on_equilibrium_complete(self, key, result):
+        if key != self._equilibrium_request_key:
+            return
+        self._equilibrium_cache_key = key
+        self._equilibrium_results = result["results"]
+        self._equilibrium_sets = result["sets"]
+        self._equilibrium_analysis = result["analysis"]
+        self._orbit_anchors = result["anchors"]
+        self._render_equilibrium_rows(result["rows"])
+        if self._dimension == "3D":
+            self.canvas3d.set_equilibrium_points(
+                self._equilibrium_results, self.show_equilibria.isChecked())
+        else:
+            self._static_refresh_timer.start(20)
+
+    def _on_equilibrium_failed(self, key, message):
+        if key == self._equilibrium_request_key:
+            self._set_equilibrium_message(f"Equilibrium analysis incomplete: {message}")
 
     def _render_equilibrium_rows(self, rows):
         self._equilibrium_message = None
         dark = self.dark_mode_check.isChecked()
         foreground = "#ffffff" if dark else "#000000"
-        self._equilibrium_rows = list(rows)
-        blocks = []
-        for row in rows:
-            segments = re.split(r"(\$[^$]*\$)", row)
-            rendered = []
-            for segment in segments:
-                if segment.startswith("$") and segment.endswith("$"):
-                    rendered.append(self._math_text_html(segment[1:-1], foreground))
-                else:
-                    rendered.append(html.escape(segment).replace("  ", "&nbsp;&nbsp;"))
-            blocks.append(
-                "<div style='margin:0 0 5px 0; white-space:normal; line-height:1.5;'>"
-                + "".join(rendered) + "</div>"
-            )
-        self.equilibrium_info.setText(
-            f"<div style='color:{foreground}; font-family:Times New Roman,serif; "
-            f"font-size:11pt; letter-spacing:0;'>{''.join(blocks)}</div>"
-        )
-        self.equilibrium_info.setMinimumSize(0, 80)
+        self._equilibrium_base_rows = list(rows)
+        displayed = list(rows)
+        if self.show_equilibria.isChecked() and self._periodic_key == self._periodic_model_key():
+            displayed.extend(self._periodic_rows)
+        self._equilibrium_rows = displayed
+        self.equilibrium_info.set_rows(displayed, foreground)
 
     def _set_equilibrium_message(self, message):
         self._equilibrium_rows = []
+        self._equilibrium_base_rows = [message]
         self._equilibrium_message = message
         foreground = "#ffffff" if self.dark_mode_check.isChecked() else "#000000"
-        self.equilibrium_info.setText(
-            f"<span style='color:{foreground}; font-family:Times New Roman,serif; "
-            f"font-size:11pt; letter-spacing:0;'>{html.escape(message)}</span>"
-        )
+        self.equilibrium_info.set_rows([message], foreground)
 
-    @staticmethod
-    def _math_text_html(expression, foreground):
-        expression = expression.replace("<", "\ue000").replace(">", "\ue001")
-        expression = html.escape(expression)
-        expression = expression.replace(r"\delta ", "δ")
-        expression = expression.replace(r"\cdot ", " · ")
-        expression = expression.replace(r"\lambda", "λ")
-        expression = expression.replace(r"\dot V", "V̇")
-        expression = expression.replace(r"\leq", "≤")
-        expression = expression.replace(r"\quad", "  ")
-        expression = re.sub(r"\\(?:mathrm|mathit)\{([^{}]*)\}", r"\1", expression)
-        expression = expression.replace("+", " + ").replace("-", "−")
-        expression = re.sub(r"\s+", " ", expression).replace("=", " = ")
-        expression = re.sub(r"−\s+(?=\d)", "−", expression)
-        expression = re.sub(r"([A-Za-z]+̇?|[λδ])", r"<i>\1</i>", expression)
-        expression = re.sub(r"\^\{([^{}]+)\}", r"<sup>\1</sup>", expression)
-        expression = re.sub(r"_\{([^{}]+)\}", r"<sub>\1</sub>", expression)
-        expression = expression.replace("\ue000", "&lt;").replace("\ue001", "&gt;")
-        return (f"<span style='font-family:Times New Roman,serif; font-size:11pt; "
-                f"color:{foreground};'>{expression}</span>")
+    def _periodic_model_key(self):
+        if self._dimension != "2D" or self.fx is None or self.fy is None:
+            return None
+        if self._equilibrium_request_key is None:
+            return None
+        xmin, xmax, ymin, ymax = self._equilibrium_request_key[3]
+        return (ast.dump(self.fx), ast.dump(self.fy),
+                tuple(sorted(self.params.items())), (xmin, xmax, ymin, ymax))
 
-    def render_static_background(self, bounds):
+    def _request_periodic_orbits(self):
+        if (self._dimension != "2D" or not self.show_equilibria.isChecked()
+                or self._equilibrium_cache_key != self._equilibrium_request_key):
+            return
+        key = self._periodic_model_key()
+        if key == self._periodic_key:
+            return
+        self._periodic_key = key
+        self._periodic_orbits = []
+        self._periodic_rows = ["Searching periodic orbits..."]
+        self._render_equilibrium_rows(self._equilibrium_base_rows)
+        self._periodic_process.timeout_ms = 10000
+        self._periodic_process.submit(key, {
+            "fields": (self.fx, self.fy), "params": dict(self.params),
+            "bounds": key[3], "anchors": self._orbit_anchors,
+            "analysis": self._equilibrium_analysis,
+        }, "periodic")
+
+    def _on_periodic_complete(self, key, result):
+        if key[0] == "trajectory3d":
+            self._on_trajectory3d_complete(key, result)
+            return
+        if not self.show_equilibria.isChecked() or key != self._periodic_model_key():
+            return
+        self._periodic_orbits, self._periodic_rows = result
+        self._render_equilibrium_rows(self._equilibrium_base_rows)
+        self._static_refresh_timer.start(20)
+
+    def _on_periodic_failed(self, key, message):
+        if key[0] == "trajectory3d":
+            if key == self._pending_3d_key:
+                self._pending_3d_key = None
+                self.status.setText(f"3D trajectory incomplete: {message}")
+            return
+        if key != self._periodic_key:
+            return
+        self._periodic_orbits = []
+        self._periodic_rows = [f"Periodic-orbit analysis incomplete: {message}"]
+        self._render_equilibrium_rows(self._equilibrium_base_rows)
+
+    def _trajectory3d_key(self):
+        if self._dimension != "3D":
+            return None
+        return ("trajectory3d", tuple(ast.dump(field) for field in (self.fx, self.fy, self.fz)),
+                tuple(sorted(self.params.items())),
+                tuple(spin.value() for spin in self.initial_spins), self.dt.value())
+
+    def _on_trajectory3d_complete(self, key, result):
+        if key != self._pending_3d_key or key != self._trajectory3d_key():
+            return
+        self._pending_3d_key = None
+        try:
+            self.canvas3d.set_model(
+                (self.fx, self.fy, self.fz), self.params,
+                tuple(spin.value() for spin in self.initial_spins), self.dt.value(),
+                self.dark_mode_check.isChecked(), self.speed_color.isChecked(), self.speed.value(),
+                self.color_max.value() if self.fixed_colors.isChecked() else None, result)
+        except Exception as exc:
+            self._display_3d_key = None
+            self._resume_3d_after_analysis = False
+            self.status.setText(f"3D trajectory display failed: {exc}")
+            return
+        self._display_3d_key = key
+        self._model_applied = True
+        self._gpu_ready = True
+        self._update_equilibrium_info()
+        self._update_speed_legend()
+        self.status.setText(f"3D trajectory ready: {self.canvas3d.integration_status}.")
+        if self._resume_3d_after_analysis:
+            self.toggle_animation()
+
+    def closeEvent(self, event):
+        self._auto_apply_timer.stop()
+        self._static_refresh_timer.stop()
+        self._view_settle_timer.stop()
+        self._equilibrium_debounce.stop()
+        self._nullcline_debounce.stop()
+        self._equilibrium_process.close()
+        self._periodic_process.close()
+        self._nullcline_process.close()
+        super().closeEvent(event)
+
+    def _nullcline_model_key(self):
+        return (ast.dump(self.fx), ast.dump(self.fy), tuple(sorted(self.params.items())))
+
+    def _request_nullclines(self, bounds, resolution):
+        key = (self._nullcline_model_key(), tuple(bounds), resolution)
+        if key == self._nullcline_key:
+            return
+        self._nullcline_key = key
+        self._nullcline_pending_request = (key, {
+            "fields": (self.fx, self.fy), "params": dict(self.params),
+            "bounds": tuple(bounds), "resolution": resolution,
+        })
+        self._nullcline_debounce.start()
+
+    def _dispatch_nullcline_analysis(self):
+        if self._nullcline_pending_request is not None:
+            key, payload = self._nullcline_pending_request
+            self._nullcline_pending_request = None
+            self._nullcline_process.submit(key, payload, "nullclines")
+
+    def _on_nullclines_complete(self, key, result):
+        if key != self._nullcline_key or not self.show_nullclines.isChecked():
+            return
+        self._nullcline_paths_model = key[0]
+        self._nullcline_paths = result
+        self._static_refresh_timer.start(20)
+
+    def _on_nullclines_failed(self, key, message):
+        if key == self._nullcline_key and self.show_nullclines.isChecked():
+            self.status.setText(f"Nullcline analysis incomplete: {message}")
+
+    def render_static_background(self, bounds, interactive=False):
         xmin, xmax, ymin, ymax = bounds
         dark = self.dark_mode_check.isChecked()
         background = "#000000" if dark else "#ffffff"
@@ -4237,14 +5246,17 @@ class ODEFlowApp(QMainWindow):
         grid_color = "#777777" if dark else "#aaaaaa"
         spine_color = "#393939" if dark else "#c8c8c8"
         ratio = self.flow_canvas.devicePixelRatioF()
-        pixel_width = max(1, int(self.flow_canvas.width() * ratio))
-        pixel_height = max(1, int(self.flow_canvas.height() * ratio))
+        physical_size = self.flow_canvas.size() * ratio
+        pixel_width = max(1, physical_size.width())
+        pixel_height = max(1, physical_size.height())
         dpi = 144
-        figure = Figure(
-            figsize=(pixel_width / dpi, pixel_height / dpi),
-            facecolor=background, dpi=dpi,
-        )
-        canvas = FigureCanvasAgg(figure)
+        if not hasattr(self, "_static_figure"):
+            self._static_figure = Figure(dpi=dpi)
+            self._static_agg = FigureCanvasAgg(self._static_figure)
+        figure, canvas = self._static_figure, self._static_agg
+        figure.clear()
+        figure.set_size_inches(pixel_width / dpi, pixel_height / dpi, forward=False)
+        figure.set_facecolor(background)
         ax = figure.add_subplot(111)
         ax.set_facecolor(background)
         ax.set_xlim(xmin, xmax)
@@ -4272,7 +5284,19 @@ class ODEFlowApp(QMainWindow):
             self._speed_max = 1.0
         if self.fixed_colors.isChecked():
             self._speed_max = self.color_max.value()
-        self._update_speed_legend()
+        if self.show_nullclines.isChecked():
+            left, bottom, width, height = ax.get_position().bounds
+            resolution = int(np.clip(max(width * pixel_width, height * pixel_height), 257, 769)) | 1
+            if not interactive:
+                self._request_nullclines(bounds, resolution)
+            colors = ("#ffad33", "#54d98c") if dark else ("#e68a00", "#20a05a")
+            if self._nullcline_paths_model == self._nullcline_model_key():
+                for (lines, fills), color in zip(self._nullcline_paths, colors):
+                    if lines:
+                        ax.add_collection(LineCollection(lines, colors=[color], linewidths=1.25, zorder=4))
+                    for vertices, codes in fills:
+                        ax.add_patch(PathPatch(MathPath(vertices, codes), facecolor=color,
+                                               edgecolor="none", alpha=0.07, zorder=1))
         if self._selected_solution is not None and self.show_selected.isChecked():
             solution = self._selected_solution
             if solution["signature"] == self._solution_signature():
@@ -4287,7 +5311,8 @@ class ODEFlowApp(QMainWindow):
                 # Keep curvature-controlled points; renderer simplification may
                 # otherwise turn a precisely sampled curve back into long chords.
                 line.get_path().should_simplify = False
-                ax.scatter(*points[0, :2], color=color, s=18, edgecolors="none", zorder=6)
+                ax.scatter(*points[0, :2], s=12, facecolors="none",
+                           edgecolors=color, linewidths=0.9, zorder=6)
 
         if self.show_field.isChecked():
             mag = np.hypot(U, V)
@@ -4296,6 +5321,22 @@ class ODEFlowApp(QMainWindow):
                 color=primary, alpha=0.42, pivot="mid", scale=38,
                 width=0.002
             )
+        if self.show_equilibria.isChecked():
+            red = "#ff6262" if dark else "#df3030"
+            for item in self._equilibrium_sets:
+                nx, ny, components = sample_nullclines(
+                    (item["field"], self.fx, self.fy), self.params, bounds,
+                    257 if interactive else 401)
+                component = components[0]
+                if component.count() == 0:
+                    continue
+                minimum, maximum = component.min(), component.max()
+                if minimum == maximum == 0:
+                    ax.contourf(nx, ny, np.ma.array(np.ones(component.shape), mask=component.mask),
+                                levels=[0.5, 1.5], colors=[red], alpha=0.07, zorder=2)
+                elif minimum <= 0 <= maximum and minimum != maximum:
+                    ax.contour(nx, ny, component, levels=[0], colors=[red],
+                               linewidths=1.7, corner_mask=False, zorder=6)
         if self.show_equilibria.isChecked() and self._equilibrium_results:
             points = np.asarray([point for point, _details in self._equilibrium_results])
             visible = (
@@ -4305,23 +5346,40 @@ class ODEFlowApp(QMainWindow):
             if np.any(visible):
                 ax.scatter(
                     points[visible, 0], points[visible, 1], s=35,
-                    color="#ffad33" if dark else "#d98200",
+                    color="#ff6262" if dark else "#df3030",
                     edgecolors="none", linewidths=0, zorder=6,
                 )
+        if self.show_equilibria.isChecked() and self._periodic_key == self._periodic_model_key():
+            for orbit in self._periodic_orbits:
+                points = orbit["points"]
+                line, = ax.plot(points[:, 0], points[:, 1],
+                                color="#ff92df" if dark else "#ba277f",
+                                linewidth=1.5, solid_joinstyle="round", solid_capstyle="round", zorder=5)
+                line.get_path().should_simplify = False
         canvas.draw()
         left, bottom, width, height = ax.get_position().bounds
         plot_rect = (left, left + width, bottom, bottom + height)
-        output = io.BytesIO()
-        canvas.print_png(output)
-        figure.clear()
-        return output.getvalue(), plot_rect
+        self._update_speed_legend(plot_rect)
+        # Keep the Agg renderer's RGBA pixels. PNG encoding both redraws the
+        # figure and compresses it, only for Qt to immediately decode it again.
+        image_width, image_height = canvas.get_width_height()
+        image = QImage(canvas.buffer_rgba(), image_width, image_height,
+                       image_width * 4, QImage.Format.Format_RGBA8888).copy()
+        return image, plot_rect
 
-    def _refresh_static_background(self):
+    def _finish_view_interaction(self):
+        self._static_refresh_timer.stop()
+        self._refresh_static_background(final=True)
+
+    def _refresh_static_background(self, final=False):
         if not self._model_applied or self._dimension != "2D" or not self._last_apply_valid:
             return
         try:
-            self._update_equilibrium_info(self._active_bounds)
-            background, plot_rect = self.render_static_background(self._active_bounds)
+            interactive = self._view_settle_timer.isActive() and not final
+            if not interactive:
+                self._update_equilibrium_info(self._active_bounds)
+                self._request_periodic_orbits()
+            background, plot_rect = self.render_static_background(self._active_bounds, interactive)
             self.flow_canvas.set_background(background, plot_rect)
             self.flow_canvas.speed_max = max(self._speed_max, 1e-9)
             self.flow_canvas.update()
@@ -4356,7 +5414,8 @@ class ODEFlowApp(QMainWindow):
 
     def reset_view(self):
         if self._dimension == "2D":
-            self._set_view_bounds((-5.0, 5.0, -5.0, 5.0))
+            self._set_view_bounds((0.0, 5.0, 0.0, 5.0) if self.first_quadrant.isChecked()
+                                  else (-5.0, 5.0, -5.0, 5.0))
         else:
             self.canvas3d.reset_view()
 
@@ -4365,12 +5424,18 @@ class ODEFlowApp(QMainWindow):
             return
         xmin, xmax, ymin, ymax = self.flow_canvas.bounds
         half_width, half_height = (xmax-xmin)/2, (ymax-ymin)/2
-        self._set_view_bounds((-half_width, half_width, -half_height, half_height))
+        self._set_view_bounds((0.0, half_width*2, 0.0, half_height*2)
+                              if self.first_quadrant.isChecked()
+                              else (-half_width, half_width, -half_height, half_height))
 
     def clear_trails(self):
         if self._dimension == "2D":
             self.flow_canvas.clear_trails()
         elif self._model_applied:
+            if self._pending_3d_key is not None:
+                self._periodic_process.cancel()
+                self._pending_3d_key = None
+                self._resume_3d_after_analysis = False
             self.stop_animation()
             if self._selected_solution is not None and self.show_selected.isChecked():
                 self.canvas3d._marker.set_data([], [])
@@ -4378,7 +5443,7 @@ class ODEFlowApp(QMainWindow):
                 self.canvas3d.canvas.draw_idle()
             else:
                 self.canvas3d.clear_trails()
-                self.status.setText("Dynamic path cleared · Start regenerates it.")
+                self.status.setText("Dynamic path cleared. Start regenerates it.")
 
     def stop_animation(self, clear_dynamic=False):
         self.running = False
@@ -4399,6 +5464,14 @@ class ODEFlowApp(QMainWindow):
         if not getattr(self, "_last_apply_valid", False):
             self.status.setText("Correct the equation inputs before starting.")
             return
+        if self._dimension == "3D":
+            if self._pending_3d_key is not None:
+                self.status.setText("The 3D trajectory is still being calculated.")
+                return
+            if self._display_3d_key != self._trajectory3d_key():
+                self.apply_model()
+                self._resume_3d_after_analysis = True
+                return
         if self._dimension == "2D" and not self.flow_canvas.ready:
             self.status.setText("OpenGL is still starting.")
             return
