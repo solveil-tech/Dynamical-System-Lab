@@ -2,6 +2,7 @@
 import re
 import numpy as np
 from PySide6.QtCore import QTimer, QSignalBlocker, Qt
+from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QGridLayout, QHBoxLayout,
     QGroupBox, QLabel, QPushButton, QCheckBox, QScrollArea, QFrame, QFileDialog)
 from matplotlib.figure import Figure
@@ -86,7 +87,7 @@ class BifurcationPanel(QWidget):
         self.mode.addItems(["Quasistatic", "Finite-rate"])
         self.direction.addItems(["Increasing μ", "Decreasing μ"])
         self.roundtrip = QCheckBox("Round trip")
-        self.roundtrip.setChecked(True)
+        self.roundtrip.setChecked(False)
         self.rate = host.make_spin(0.1, 0.001, 100, 0.01, compact_decimals=True)
         self.rate.setEnabled(False)
         self.perturbation = host.make_spin(0.001, -1, 1, 0.001)
@@ -123,7 +124,9 @@ class BifurcationPanel(QWidget):
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.ax = self.figure.add_subplot(111)
         layout.addWidget(self.canvas, 1)
-        self.key_label = QLabel("Blue solid: stable   Red dashed: unstable   Orange: semistable / inconclusive   Gray dotted: fₓ = 0\nPurple: outward sweep   Green: return sweep   Dashed sweep connectors: jumps / fast relaxation")
+        self.key_label = QLabel()
+        self.key_label.setTextFormat(Qt.TextFormat.RichText)
+        self._update_key()
         self.key_label.setWordWrap(True)
         layout.addWidget(self.key_label)
         self.info = info_class()
@@ -331,21 +334,46 @@ class BifurcationPanel(QWidget):
         if self.result is None:
             self.info.set_rows(["Enter a scalar system and select the analysis window."], self.fg)
             return
-        rows = []
+        rows, bold_phrases = [], []
         m0, m1, x0, x1 = (spin.value() for spin in self.bounds)
         for p in self.result["critical"]:
             if not (m0 <= p["mu"] <= m1 and x0 <= p["x"] <= x1):
                 continue
             rows.append(f"$(\\mu,x)=({p['mu_text']},{p['x_text']})$    {p['kind']}    {p['stability']} at the critical parameter")
+            bold_phrases.extend((p["kind"], p["stability"]))
         rows += self.result["notes"]
         if self.trace_result:
             rows.append(self.trace_result["reversibility"])
+            bold_phrases.append(self.trace_result["reversibility"])
             if self.trace_result["mode"] == "quasistatic":
                 rows.append("Quasistatic branch following; dashed connectors represent fast relaxation, not finite-time discontinuities. Perturbation applies only at loss of stability.")
         self.info.set_rows(rows, self.fg)
+        bold = QTextCharFormat()
+        bold.setFontWeight(QFont.Weight.Bold)
+        document = self.info.document()
+        for phrase in set(bold_phrases):
+            cursor = QTextCursor(document)
+            while phrase:
+                cursor = document.find(phrase, cursor)
+                if cursor.isNull():
+                    break
+                cursor.mergeCharFormat(bold)
+
+    def _update_key(self):
+        blue = "#80cfff" if self.dark else "#2453a5"
+        red = "#ff7272" if self.dark else "#ca4040"
+        self.key_label.setText(
+            f'<span style="color:{blue}">Blue solid: stable</span>&nbsp;&nbsp; '
+            f'<span style="color:{red}">Red dashed: unstable</span>&nbsp;&nbsp; '
+            '<span style="color:#e29834">Orange: semistable / inconclusive</span>&nbsp;&nbsp; '
+            'Gray dotted: fₓ = 0<br>'
+            '<span style="color:#c0429b">Purple: outward sweep</span>&nbsp;&nbsp; '
+            '<span style="color:#219c79">Green: return sweep</span>&nbsp;&nbsp; '
+            '<span style="color:#c0429b">Dashed sweep connectors: jumps / fast relaxation</span>')
 
     def set_dark(self, dark):
         self.dark = bool(dark)
+        self._update_key()
         self.info_scroll.setStyleSheet(self.host.equilibrium_scroll.styleSheet())
         self._info()
         self.draw()
@@ -377,8 +405,6 @@ class BifurcationPanel(QWidget):
                                         linewidths=1, linestyles="dotted", alpha=.75))
             for p in self.result["critical"]:
                 self.ax.scatter(p["mu"], p["x"], c="#e35b25", s=30, edgecolors="none", zorder=6)
-                self.ax.annotate(p["kind"], (p["mu"], p["x"]), xytext=(8, 9),
-                                 textcoords="offset points", fontsize=8, color=fg)
         if self.trace_result:
             for i, path in enumerate(self.trace_result["segments"]):
                 if len(path):

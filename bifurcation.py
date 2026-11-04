@@ -246,8 +246,6 @@ def analyze(data):
                              stability=stability(expression, {X: xx, MU: mm})))
     if not critical and expression != 0:
         notes.append("No isolated critical point detected inside the selected window.")
-    if exact and expression != 0:
-        notes.append("Isolated critical points solved algebraically; branch curves are sampled in this window.")
     segments = contours(expression, bounds, guards)
     if len(segments):
         middle = segments.mean(axis=1)
