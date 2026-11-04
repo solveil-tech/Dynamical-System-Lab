@@ -3757,6 +3757,15 @@ class ODEFlowApp(QMainWindow):
         self.equilibrium_scroll.setWidget(self.equilibrium_info)
         equilibrium_layout.addWidget(self.equilibrium_scroll)
         plot_layout.addWidget(equilibrium_box)
+        from bifurcation_ui import BifurcationPanel
+        self.bifurcation_panel = BifurcationPanel(
+            self, NotationLineEdit, PopupComboBox, EquilibriumInfo, format_formula_input)
+        bifurcation_index = self.right_tabs.addTab(self.bifurcation_panel, "Bifurcation")
+        def select_analysis_tab(index):
+            equilibrium_box.setVisible(index != bifurcation_index)
+            if index == bifurcation_index:
+                self.bifurcation_panel.activate()
+        self.right_tabs.currentChanged.connect(select_analysis_tab)
 
         splitter.addWidget(panel)
         splitter.addWidget(plot_panel)
@@ -4466,6 +4475,8 @@ class ODEFlowApp(QMainWindow):
             self._set_equilibrium_message(self._equilibrium_message)
         if hasattr(self, "time_figure"):
             self._draw_time_series()
+        if hasattr(self, "bifurcation_panel"):
+            self.bifurcation_panel.set_dark(dark)
 
     def _on_visual_options_changed(self, _checked=False):
         if not self.show_nullclines.isChecked():
@@ -5196,6 +5207,7 @@ class ODEFlowApp(QMainWindow):
             self.toggle_animation()
 
     def closeEvent(self, event):
+        self.bifurcation_panel.close_workers()
         self._auto_apply_timer.stop()
         self._static_refresh_timer.stop()
         self._view_settle_timer.stop()

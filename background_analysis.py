@@ -262,6 +262,7 @@ def compute_trajectory3d(data):
 
 def _serve():
     import ode_flow  # Warm imports once, without constructing a window.
+    from bifurcation import analyze as analyze_bifurcation, trace as trace_bifurcation
     sys.stdout.buffer.write(_pack({"ready": True}))
     sys.stdout.buffer.flush()
     for line in sys.stdin.buffer:
@@ -271,7 +272,9 @@ def _serve():
         try:
             handler = {"equilibrium": compute_equilibria, "periodic": compute_periodic,
                        "nullclines": compute_nullclines,
-                       "trajectory3d": compute_trajectory3d}[request["kind"]]
+                       "trajectory3d": compute_trajectory3d,
+                       "bifurcation": analyze_bifurcation,
+                       "bifurcation_trace": trace_bifurcation}[request["kind"]]
             result = handler(request["payload"])
             message = {"id": request["id"], "result": result}
         except Exception as exc:
