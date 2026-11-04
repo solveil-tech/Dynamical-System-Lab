@@ -1,4 +1,4 @@
-"""Trajectory integration and portable experiment settings for ODE Flow Lab."""
+"""Trajectory integration and portable settings for Dynamical System Lab."""
 import math
 import time
 
@@ -165,7 +165,9 @@ SETTING_RANGES = {
 
 def validate_experiment(data):
     """Validate the whole document before the application changes any state."""
-    if not isinstance(data, dict) or data.get("format") != "ODE Flow Lab" or data.get("version") != 1:
+    if (not isinstance(data, dict)
+            or data.get("format") not in ("Dynamical System Lab", "ODE Flow Lab")
+            or data.get("version") != 1):
         raise ValueError("Unsupported experiment file.")
     if data.get("dimension") not in ("2D", "3D") or data.get("coordinates") not in ("Cartesian", "Polar"):
         raise ValueError("Invalid dimension or coordinate mode.")

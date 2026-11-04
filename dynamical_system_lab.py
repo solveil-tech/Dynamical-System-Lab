@@ -3322,13 +3322,13 @@ class EquilibriumInfo(QTextEdit):
         return data
 
 
-class ODEFlowApp(QMainWindow):
+class DynamicalSystemLab(QMainWindow):
     def __init__(self):
         super().__init__()
         if sys.platform == "win32":
             for font_file in ("times.ttf", "timesi.ttf", "timesbd.ttf", "timesbi.ttf"):
                 QFontDatabase.addApplicationFont("C:\\Windows\\Fonts\\" + font_file)
-        self.setWindowTitle("ODE Flow Lab — 2D / 3D Phase Portrait")
+        self.setWindowTitle("Dynamical System Lab")
         self.setMinimumWidth(900)
         self.resize(round(self.minimumWidth() * 1.2), 820)
 
@@ -3429,10 +3429,17 @@ class ODEFlowApp(QMainWindow):
         controls.setContentsMargins(12, 6, 12, 6)
         controls.setSpacing(4)
 
-        title = QLabel("ODE Flow Lab")
+        self.title_header = QWidget()
+        title_layout = QHBoxLayout(self.title_header)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(8)
+        title = QLabel("Dynamical System Lab")
         self.title_label = title
         title.setStyleSheet("font-size: 21px; font-weight: 700; color: #111111;")
-        controls.addWidget(title)
+        title_layout.addWidget(title, 1)
+        self.dark_mode_check = QCheckBox("Dark mode")
+        title_layout.addWidget(self.dark_mode_check, 0, Qt.AlignmentFlag.AlignRight)
+        controls.addWidget(self.title_header)
 
         eq_box = QGroupBox("Differential equations")
         eq_form = QFormLayout(eq_box)
@@ -3633,7 +3640,6 @@ class ODEFlowApp(QMainWindow):
             "Colors use the vector-field magnitude |F| on a log scale. "
             "Unit speed changes particle motion, not this magnitude."
         )
-        self.dark_mode_check = QCheckBox("Dark mode")
         self.show_nullclines = QCheckBox("Show nullclines")
         self.show_nullclines.setToolTip(
             "2D nullclines: dx/dt = 0 in orange; dy/dt = 0 in green.\n"
@@ -3660,7 +3666,6 @@ class ODEFlowApp(QMainWindow):
         visual_options = QHBoxLayout()
         visual_options.setSpacing(12)
         visual_options.addWidget(self.speed_color)
-        visual_options.addWidget(self.dark_mode_check)
         controls.addLayout(visual_options)
         equilibrium_options = QHBoxLayout()
         equilibrium_options.setSpacing(12)
@@ -3761,7 +3766,16 @@ class ODEFlowApp(QMainWindow):
         self.bifurcation_panel = BifurcationPanel(
             self, NotationLineEdit, PopupComboBox, EquilibriumInfo, format_formula_input)
         bifurcation_index = self.right_tabs.addTab(self.bifurcation_panel, "Bifurcation")
+        self.right_tabs.setTabVisible(bifurcation_index, False)
+        self.bifurcation_btn = QPushButton("Bifurcation")
+        self.bifurcation_btn.setCheckable(True)
+        self.right_tabs.setCornerWidget(self.bifurcation_btn, Qt.Corner.TopRightCorner)
+        def open_bifurcation():
+            self.right_tabs.setCurrentIndex(bifurcation_index)
+            self.bifurcation_btn.setChecked(True)
+        self.bifurcation_btn.clicked.connect(open_bifurcation)
         def select_analysis_tab(index):
+            self.bifurcation_btn.setChecked(index == bifurcation_index)
             equilibrium_box.setVisible(index != bifurcation_index)
             if index == bifurcation_index:
                 self.bifurcation_panel.activate()
@@ -4168,7 +4182,7 @@ class ODEFlowApp(QMainWindow):
         modes = dict(self._mode_states)
         modes[self._editor_state_key()] = self._read_editor_state()
         return {
-            "format": "ODE Flow Lab", "version": 1,
+            "format": "Dynamical System Lab", "version": 1,
             "dimension": self._dimension, "coordinates": self._coordinates,
             "modes": modes, "initial": [spin.value() for spin in self.initial_spins],
             "solution_computed": self._selected_solution is not None,
@@ -5506,8 +5520,10 @@ def main():
     surface_format.setSamples(0)
     QSurfaceFormat.setDefaultFormat(surface_format)
     app = QApplication(sys.argv)
+    app.setApplicationName("Dynamical System Lab")
+    app.setApplicationDisplayName("Dynamical System Lab")
     app.setStyle("Fusion")
-    window = ODEFlowApp()
+    window = DynamicalSystemLab()
     window.show()
     sys.exit(app.exec())
 

@@ -1,4 +1,4 @@
-# Scalar bifurcation page
+# Dynamical System Lab — scalar bifurcation page
 
 The pre-feature version is saved on `main` and GitHub as commit `9240613`.
 The new Bifurcation tab has independent equations and settings; the phase-flow

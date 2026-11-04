@@ -135,7 +135,7 @@ class AnalysisProcess(QObject):
 def compute_equilibria(data):
     import ast
     import numpy as np
-    import ode_flow as core
+    import dynamical_system_lab as core
     fields, params, bounds = data["fields"], data["params"], data["bounds"]
     two_d = len(fields) == 2
     note = data["note"]
@@ -199,7 +199,7 @@ def compute_equilibria(data):
 
 def compute_periodic(data):
     import numpy as np
-    import ode_flow as core
+    import dynamical_system_lab as core
     fields, params = data["fields"], data["params"]
     def field(points):
         return np.column_stack([np.broadcast_to(
@@ -226,7 +226,7 @@ def compute_periodic(data):
 
 def compute_nullclines(data):
     import numpy as np
-    import ode_flow as core
+    import dynamical_system_lab as core
     from matplotlib.path import Path as MathPath
     figure = core.Figure()
     ax = figure.add_subplot(111)
@@ -255,13 +255,13 @@ def compute_nullclines(data):
 
 
 def compute_trajectory3d(data):
-    import ode_flow as core
+    import dynamical_system_lab as core
     return core.Flow3DCanvas._integrate(
         data["fields"], data["params"], data["initial"], data["dt"])
 
 
 def _serve():
-    import ode_flow  # Warm imports once, without constructing a window.
+    import dynamical_system_lab  # Warm imports once, without constructing a window.
     from bifurcation import analyze as analyze_bifurcation, trace as trace_bifurcation
     sys.stdout.buffer.write(_pack({"ready": True}))
     sys.stdout.buffer.flush()

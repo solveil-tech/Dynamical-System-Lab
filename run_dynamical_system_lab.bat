@@ -1,4 +1,5 @@
 @echo off
+title Dynamical System Lab
 setlocal
 cd /d "%~dp0"
 
@@ -14,5 +15,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-"%PYTHON%" "%~dp0ode_flow.py"
+"%PYTHON%" "%~dp0dynamical_system_lab.py"
 if errorlevel 1 pause

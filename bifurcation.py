@@ -12,7 +12,7 @@ X, MU = sp.symbols("x mu", real=True)
 
 
 def scalar_model(source):
-    from ode_flow import compile_formula, FUNCTIONS
+    from dynamical_system_lab import compile_formula, FUNCTIONS
     from equilibrium_algebra import symbolic_expression
     source = re.sub(r"\bmu\b", "μ", source)
     tree = compile_formula(source, {"μ"})
