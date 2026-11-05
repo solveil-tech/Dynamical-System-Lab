@@ -32,7 +32,7 @@ from PySide6.QtGui import (
     QFont, QFontDatabase, QImage, QPixmap, QPainter, QSurfaceFormat, QVector4D,
     QColor, QRawFont, QGlyphRun, QPyTextObject, QTextFormat,
     QTextCharFormat, QTextCursor, QTextBlockFormat,
-    QSyntaxHighlighter, QPainterPath, QFontMetricsF, QLinearGradient, QBrush,
+    QSyntaxHighlighter, QPainterPath,
 )
 from PySide6.QtOpenGL import (
     QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat,
@@ -3368,21 +3368,8 @@ class SpeedColorButton(QToolButton):
     def __init__(self):
         super().__init__()
         self.setCheckable(True)
-        self.setText("speed color")
-        self.caption_font = QFont(self.font())
-        self.caption_font.setPointSizeF(max(7, self.caption_font.pointSizeF()-1))
-        metrics = QFontMetricsF(self.caption_font)
-        text_width = metrics.horizontalAdvance(self.text())
-        self.setFixedSize(36+math.ceil(text_width)+2, 26)
+        self.setFixedSize(32, 26)
         self.setAccessibleName("Speed color")
-        self.caption_path = QPainterPath()
-        self.caption_path.addText(36, (26-metrics.height())/2+metrics.ascent(),
-                                  self.caption_font, self.text())
-        gradient = QLinearGradient(36, 0, 36+text_width, 0)
-        colormap = speed_colormap()
-        for stop in np.linspace(0, 1, 17):
-            gradient.setColorAt(float(stop), QColor.fromRgbF(*colormap(float(stop))[:3]))
-        self.caption_gradient = QBrush(gradient)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet("QToolButton {border: none; background: transparent; padding: 0;}")
         self.dark = False
@@ -3411,16 +3398,6 @@ class SpeedColorButton(QToolButton):
                     color = QColor(gray, gray, gray)
                 painter.setBrush(color)
                 painter.drawPie(rect, angle*16, 15*16+8)
-        painter.setClipping(False)
-        if self.isChecked():
-            # A subpixel raised edge, lit from the upper left, separates pale
-            # spectrum colors from the background without a heavy outline.
-            painter.fillPath(self.caption_path.translated(-.35, -.4),
-                             QBrush(QColor(255, 255, 255, 110 if self.dark else 70)))
-            painter.fillPath(self.caption_path.translated(.55, .65),
-                             QBrush(QColor(0, 0, 0, 140 if self.dark else 105)))
-        painter.fillPath(self.caption_path, self.caption_gradient if self.isChecked() else
-                         QBrush(QColor("#a0a0a0" if self.dark else "#777777")))
 
 
 class DynamicalSystemLab(QMainWindow):
