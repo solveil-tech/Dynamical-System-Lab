@@ -20,9 +20,10 @@ slot is reserved even when Speed colors is off, so toggling it does not move or
 resize the plot. During window resizing the cached background retains its aspect
 ratio and alignment with particles until the native-resolution redraw arrives.
 The phase axes are horizontally centered with equal left/right margins. The
-window's outer aspect ratio (including its title bar) is locked to the minimum
-Flow workspace size measured at startup. Edge/corner resizing preserves this
-ratio; maximize fits the same proportion inside the screen's available area.
+window opens at its minimum layout size and can be resized freely in either
+direction. Compact, fixed plot margins keep the title, zoom controls and speed
+spectrum close to the frame; extra height stays below the spectrum instead of
+opening a gap between it and the plot.
 See [BIFURCATION.md](BIFURCATION.md) for
 the scalar analysis and parameter-sweep controls.
 

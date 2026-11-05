@@ -98,6 +98,9 @@ FUNCTIONS = {
     "sign": np.sign, "minimum": np.minimum, "maximum": np.maximum,
 }
 
+PHASE_TOP_MARGIN = 32
+PHASE_BOTTOM_MARGIN = 42
+
 LATEX_SYMBOLS = {
     r"\alpha": "α", r"\beta": "β", r"\gamma": "γ", r"\delta": "δ",
     r"\epsilon": "ε", r"\theta": "θ", r"\lambda": "λ", r"\mu": "μ",
@@ -2544,12 +2547,13 @@ class FlowCanvas(QOpenGLWidget):
             self.plot_rect = self._background_source_plot_rect
             return
         aspect = (self.bounds[1]-self.bounds[0])/(self.bounds[3]-self.bounds[2])
-        pw = min(.88*w, .84*h*aspect)
+        ratio = self.devicePixelRatioF()
+        pw = min(.80*w, max(1, h-(PHASE_TOP_MARGIN+PHASE_BOTTOM_MARGIN)*ratio)*aspect)
         ph = pw/aspect
         scale = min(pw/max(1e-9, sw*(right-left)), ph/max(1e-9, sh*(top-bottom)))
         vw, vh = max(1, round(sw*scale)), max(1, round(sh*scale))
         vx = round(.50*w-vw*(left+right)/2)
-        vy = round(.52*h-vh*(bottom+top)/2)
+        vy = round((h+(PHASE_BOTTOM_MARGIN-PHASE_TOP_MARGIN)*ratio)/2-vh*(bottom+top)/2)
         self._background_viewport = (vx, vy, vw, vh)
         self.plot_rect = ((vx+vw*left)/w, (vx+vw*right)/w,
                           (vy+vh*bottom)/h, (vy+vh*top)/h)
@@ -3360,14 +3364,12 @@ class EquilibriumInfo(QTextEdit):
 class DynamicalSystemLab(QMainWindow):
     def __init__(self):
         super().__init__()
-        self._window_aspect = None
-        self._aspect_resize_guard = False
         if sys.platform == "win32":
             for font_file in ("times.ttf", "timesi.ttf", "timesbd.ttf", "timesbi.ttf"):
                 QFontDatabase.addApplicationFont("C:\\Windows\\Fonts\\" + font_file)
         self.setWindowTitle("Dynamical System Lab")
         self.setMinimumWidth(900)
-        self.resize(round(self.minimumWidth() * 1.2), 820)
+        self.resize(900, 760)
 
         self.running = False
         self.fx = self.fy = None
@@ -3451,108 +3453,11 @@ class DynamicalSystemLab(QMainWindow):
 
         self.build_ui()
         QTimer.singleShot(0, self.apply_model)
-        QTimer.singleShot(120, self._initialize_window_aspect)
+        QTimer.singleShot(120, self._open_at_minimum_size)
 
-    def _frame_extra(self):
-        frame = self.frameGeometry()
-        return max(0, frame.width()-self.width()), max(0, frame.height()-self.height())
-
-    def _initialize_window_aspect(self):
-        if self._window_aspect is not None:
-            return
+    def _open_at_minimum_size(self):
         self.layout().activate()
-        base = self.minimumSize().expandedTo(self.minimumSizeHint())
-        self.setMinimumSize(base)
-        self._aspect_minimum = QSize(base)
-        fw, fh = self._frame_extra()
-        self._window_aspect = (base.width()+fw)/(base.height()+fh)
-        self._fit_window_to_screen(initial=True)
-
-    def _constrain_outer_size(self, width, height, by_width=True, scale=1.0):
-        ratio = self._window_aspect
-        fw, fh = self._frame_extra()
-        minimum_w = (self._aspect_minimum.width()+fw)*scale
-        minimum_h = (self._aspect_minimum.height()+fh)*scale
-        if by_width:
-            width = max(round(width), math.ceil(minimum_w), math.ceil(minimum_h*ratio))
-            height = round(width/ratio)
-        else:
-            height = max(round(height), math.ceil(minimum_h), math.ceil(minimum_w/ratio))
-            width = round(height*ratio)
-        return width, height
-
-    def _fit_window_to_screen(self, initial=False):
-        if self._window_aspect is None or self._aspect_resize_guard:
-            return
-        self._aspect_resize_guard = True
-        try:
-            screen = self.screen().availableGeometry()
-            fw, fh = self._frame_extra()
-            if initial:
-                width, height = self._constrain_outer_size(self.width()+fw, self.height()+fh)
-            else:
-                width, height = screen.width(), round(screen.width()/self._window_aspect)
-            if height > screen.height():
-                height = screen.height()
-                width = round(height*self._window_aspect)
-            width, height = self._constrain_outer_size(width, height, by_width=False)
-            if self.isMaximized():
-                self.showNormal()
-            self.resize(width-fw, height-fh)
-            if not initial or not screen.contains(self.frameGeometry()):
-                offset = screen.center()-self.frameGeometry().center()
-                self.move(self.pos()+offset)
-        finally:
-            self._aspect_resize_guard = False
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if (self._window_aspect is None or self._aspect_resize_guard
-                or self.isMaximized() or self.isMinimized()):
-            return
-        size, old = event.size(), event.oldSize()
-        by_width = (not old.isValid() or abs(size.width()-old.width()) >=
-                    abs(size.height()-old.height())*self._window_aspect)
-        fw, fh = self._frame_extra()
-        if abs((size.width()+fw)-(size.height()+fh)*self._window_aspect) <= 1.0:
-            return
-        width, height = self._constrain_outer_size(size.width()+fw, size.height()+fh, by_width)
-        if (width-fw, height-fh) != (size.width(), size.height()):
-            self._aspect_resize_guard = True
-            try:
-                self.resize(width-fw, height-fh)
-            finally:
-                self._aspect_resize_guard = False
-
-    def changeEvent(self, event):
-        super().changeEvent(event)
-        if (event.type() == QEvent.Type.WindowStateChange and self.isMaximized()
-                and self._window_aspect is not None):
-            QTimer.singleShot(0, self._fit_window_to_screen)
-
-    def nativeEvent(self, event_type, message):
-        if sys.platform == "win32" and self._window_aspect is not None:
-            from ctypes import wintypes
-            msg = wintypes.MSG.from_address(int(message))
-            if msg.message == 0x0214:  # WM_SIZING: constrain before Qt paints.
-                rect = wintypes.RECT.from_address(msg.lParam)
-                edge = int(msg.wParam)
-                scale = self.devicePixelRatioF()
-                old = self.frameGeometry().size()
-                width, height = rect.right-rect.left, rect.bottom-rect.top
-                by_width = edge in (1, 2) or (edge not in (3, 6) and
-                    abs(width-old.width()*scale) >= abs(height-old.height()*scale)*self._window_aspect)
-                width, height = self._constrain_outer_size(width, height, by_width, scale)
-                if edge in (1, 4, 7):
-                    rect.left = rect.right-width
-                else:
-                    rect.right = rect.left+width
-                if edge in (3, 4, 5):
-                    rect.top = rect.bottom-height
-                else:
-                    rect.bottom = rect.top+height
-                return True, 1
-        return super().nativeEvent(event_type, message)
+        self.resize(self.minimumSize().expandedTo(self.minimumSizeHint()))
 
     def build_ui(self):
         root = QWidget()
@@ -3569,8 +3474,8 @@ class DynamicalSystemLab(QMainWindow):
         panel.setMinimumWidth(360)
         panel.setMaximumWidth(390)
         controls = QVBoxLayout(panel)
-        controls.setContentsMargins(12, 6, 12, 6)
-        controls.setSpacing(4)
+        controls.setContentsMargins(12, 4, 12, 4)
+        controls.setSpacing(2)
 
         self.title_header = QWidget()
         title_layout = QHBoxLayout(self.title_header)
@@ -3587,12 +3492,13 @@ class DynamicalSystemLab(QMainWindow):
         self.flow_controls = QWidget()
         flow_controls_layout = QVBoxLayout(self.flow_controls)
         flow_controls_layout.setContentsMargins(0, 0, 0, 0)
-        flow_controls_layout.setSpacing(4)
+        flow_controls_layout.setSpacing(2)
         controls.addWidget(self.flow_controls, 1)
         controls = flow_controls_layout
 
         eq_box = QGroupBox("Differential equations")
         eq_form = QFormLayout(eq_box)
+        eq_form.setVerticalSpacing(4)
         self.dimension_selector = PopupComboBox()
         self.dimension_selector.addItems(["2D", "3D"])
         self.dimension_selector.currentTextChanged.connect(self._on_dimension_changed)
@@ -3720,7 +3626,7 @@ class DynamicalSystemLab(QMainWindow):
         form = QGridLayout(settings)
         self._two_d_only_widgets = []
         form.setHorizontalSpacing(5)
-        form.setVerticalSpacing(5)
+        form.setVerticalSpacing(3)
         self.xmin = self.make_spin(-5, -1e9, 1e9, 0.5)
         self.xmax = self.make_spin(5, -1e9, 1e9, 0.5)
         self.ymin = self.make_spin(-5, -1e9, 1e9, 0.5)
@@ -3880,7 +3786,7 @@ class DynamicalSystemLab(QMainWindow):
         self.zoom_out_btn = QPushButton("−")
         for button, label, factor in ((self.zoom_in_btn, "Zoom in", 0.8),
                                       (self.zoom_out_btn, "Zoom out", 1.25)):
-            button.setFixedSize(32, 30)
+            button.setFixedSize(32, 26)
             button.setToolTip(label)
             button.setAccessibleName(label)
             button.clicked.connect(lambda _checked=False, scale=factor: self._zoom_phase_view(scale))
@@ -3888,8 +3794,12 @@ class DynamicalSystemLab(QMainWindow):
         self.phase_zoom_controls.adjustSize()
         self.right_tabs = QTabWidget()
         phase_page = QWidget()
+        self.phase_page = phase_page
+        phase_page.installEventFilter(self)
         phase_layout = QVBoxLayout(phase_page)
+        self.phase_layout = phase_layout
         phase_layout.setContentsMargins(0, 0, 0, 0)
+        phase_layout.setSpacing(2)
         phase_tools = QHBoxLayout()
         phase_tools.setContentsMargins(0, 0, 10, 0)
         phase_tools.addStretch(1)
@@ -3900,8 +3810,10 @@ class DynamicalSystemLab(QMainWindow):
         self.speed_legend.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.speed_legend.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.speed_legend.setMinimumWidth(0)
-        self.speed_legend.setFixedHeight(44)
+        self.speed_legend.setFixedHeight(36)
         phase_layout.addWidget(self.speed_legend)
+        phase_layout.addStretch(0)
+        self.view_stack.currentChanged.connect(lambda _index: QTimer.singleShot(0, self._update_phase_layout))
         self.right_tabs.addTab(phase_page, "Phase portrait")
         self._build_experience_tabs()
         plot_layout.addWidget(self.right_tabs, 1)
@@ -4371,6 +4283,25 @@ class DynamicalSystemLab(QMainWindow):
         self._speed_legend_signature = signature
         figure.clear()
 
+    def _update_phase_layout(self):
+        if not hasattr(self, "speed_legend") or getattr(self, "_phase_layout_updating", False):
+            return
+        self._phase_layout_updating = True
+        try:
+            available = (self.phase_page.height()-self.phase_zoom_controls.height()
+                         -self.speed_legend.height()-3*self.phase_layout.spacing())
+            if self._dimension == "2D":
+                bounds = self.flow_canvas.bounds
+                aspect = (bounds[1]-bounds[0])/(bounds[3]-bounds[2])
+                desired = self.view_stack.width()*.8/aspect+PHASE_TOP_MARGIN+PHASE_BOTTOM_MARGIN
+                height = min(available, round(desired))
+                height = max(self.flow_canvas.minimumHeight(), height)
+            else:
+                height = max(self.canvas3d.minimumSizeHint().height(), available)
+            self.view_stack.setMaximumHeight(max(1, height))
+        finally:
+            self._phase_layout_updating = False
+
     def experiment_data(self):
         modes = dict(self._mode_states)
         modes[self._editor_state_key()] = self._read_editor_state()
@@ -4743,6 +4674,7 @@ class DynamicalSystemLab(QMainWindow):
         self._active_bounds = (xmin, xmax, ymin, ymax)
         if hasattr(self, "flow_canvas"):
             self.flow_canvas.set_view_bounds(self._active_bounds)
+            QTimer.singleShot(0, self._update_phase_layout)
         self._view_settle_timer.start()
         # Throttle rather than debounce: moving continuously must still redraw.
         if not self._static_refresh_timer.isActive():
@@ -5001,6 +4933,9 @@ class DynamicalSystemLab(QMainWindow):
             [normalize_display_expression(text) for text in expressions], names, reserved)
 
     def eventFilter(self, watched, event):
+        if (watched is getattr(self, "phase_page", None)
+                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
+            QTimer.singleShot(0, self._update_phase_layout)
         if watched is getattr(self, "speed_legend", None) and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._update_speed_legend)
         if event.type() == QEvent.Type.ToolTip and watched in (self.flow_canvas, self.canvas3d.canvas):
@@ -5488,8 +5423,10 @@ class DynamicalSystemLab(QMainWindow):
         ax.axvline(0, color=secondary, linewidth=0.55, alpha=0.28)
         ax.set_xlabel("x", color=primary, labelpad=8)
         ax.set_ylabel("y", color=primary, labelpad=8)
-        ax.set_title("PHASE FLOW", color=primary, pad=14, fontsize=10, fontweight="bold")
-        figure.subplots_adjust(left=0.10, right=0.90, bottom=0.10, top=0.94)
+        ax.set_title("PHASE FLOW", color=primary, pad=8, fontsize=10, fontweight="bold")
+        figure.subplots_adjust(left=0.10, right=0.90,
+            bottom=PHASE_BOTTOM_MARGIN*ratio/pixel_height,
+            top=1-PHASE_TOP_MARGIN*ratio/pixel_height)
 
         xx = np.linspace(xmin, xmax, 32)
         yy = np.linspace(ymin, ymax, 32)
