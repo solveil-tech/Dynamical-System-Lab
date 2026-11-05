@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QFormLayout, QGroupBox, QLabel, QLineEdit,
     QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox,
     QSplitter, QAbstractSpinBox, QComboBox, QStackedWidget, QSizePolicy, QFrame, QScrollArea,
-    QTabWidget, QTabBar, QFileDialog, QTextEdit, QToolButton,
+    QTabWidget, QTabBar, QFileDialog, QTextEdit, QToolButton, QGraphicsOpacityEffect,
     QProxyStyle, QStyle, QStyleOption, QStyleOptionComboBox,
 )
 
@@ -3711,12 +3711,10 @@ class DynamicalSystemLab(QMainWindow):
         self.status.setStyleSheet("color: #666666; padding: 5px 2px;")
         controls.addWidget(self.status)
         controls.addStretch()
-        self.flow_mask = QWidget(self.flow_controls)
-        self.flow_mask.setObjectName("flowControlMask")
-        self.flow_mask.setStyleSheet(
-            "QWidget#flowControlMask { background-color: rgba(128, 128, 128, 95); border: none; }")
-        self.flow_mask.hide()
-        self.flow_controls.installEventFilter(self)
+        self.flow_opacity = QGraphicsOpacityEffect(self.flow_controls)
+        self.flow_opacity.setOpacity(0.5)
+        self.flow_opacity.setEnabled(False)
+        self.flow_controls.setGraphicsEffect(self.flow_opacity)
 
         plot_panel = QWidget()
         plot_panel.setMinimumWidth(500)
@@ -3788,7 +3786,22 @@ class DynamicalSystemLab(QMainWindow):
         self.mode_tabs.setExpanding(False)
         self.mode_tabs.addTab("Flow")
         self.mode_tabs.addTab("Bifurcation")
-        self.right_tabs.setCornerWidget(self.mode_tabs, Qt.Corner.TopRightCorner)
+        self.flow_page_tabs = QTabBar()
+        self.flow_page_tabs.setShape(self.right_tabs.tabBar().shape())
+        self.flow_page_tabs.setDrawBase(False)
+        self.flow_page_tabs.setExpanding(False)
+        for index in range(3):
+            self.flow_page_tabs.addTab(self.right_tabs.tabText(index))
+        self.flow_page_tabs.currentChanged.connect(self.right_tabs.setCurrentIndex)
+        self.workspace_header = QWidget()
+        navigation = QHBoxLayout(self.workspace_header)
+        navigation.setContentsMargins(0, 0, 0, 0)
+        navigation.setSpacing(0)
+        navigation.addWidget(self.flow_page_tabs)
+        navigation.addStretch(1)
+        navigation.addWidget(self.mode_tabs)
+        plot_layout.insertWidget(0, self.workspace_header)
+        self.right_tabs.tabBar().hide()
         self.mode_tabs.currentChanged.connect(
             lambda mode: self.right_tabs.setCurrentIndex(bifurcation_index if mode == 1 else 0))
         def select_analysis_tab(index):
@@ -3796,6 +3809,10 @@ class DynamicalSystemLab(QMainWindow):
             blocker = QSignalBlocker(self.mode_tabs)
             self.mode_tabs.setCurrentIndex(1 if active else 0)
             del blocker
+            if not active:
+                blocker = QSignalBlocker(self.flow_page_tabs)
+                self.flow_page_tabs.setCurrentIndex(index)
+                del blocker
             self._set_bifurcation_mode(active)
             equilibrium_box.setVisible(not active)
             if active:
@@ -3822,10 +3839,8 @@ class DynamicalSystemLab(QMainWindow):
             self.status.setText("Paused.")
         self.flow_actions.setVisible(not active)
         self.flow_controls.setEnabled(not active)
-        self.flow_mask.setGeometry(self.flow_controls.rect())
-        self.flow_mask.setVisible(active)
-        if active:
-            self.flow_mask.raise_()
+        self.flow_opacity.setEnabled(active)
+        self.flow_page_tabs.setVisible(not active)
 
     def _build_experience_tabs(self):
         page = QWidget()
@@ -4840,9 +4855,6 @@ class DynamicalSystemLab(QMainWindow):
             [normalize_display_expression(text) for text in expressions], names, reserved)
 
     def eventFilter(self, watched, event):
-        if (watched is getattr(self, "flow_controls", None)
-                and event.type() == QEvent.Type.Resize):
-            self.flow_mask.setGeometry(watched.rect())
         if (watched is getattr(self, "view_stack", None)
                 and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
             controls = self.phase_zoom_controls
@@ -4865,7 +4877,10 @@ class DynamicalSystemLab(QMainWindow):
             on_plot = (self.flow_canvas.isVisible()
                        and self.flow_canvas._screen_to_view(self.flow_canvas.mapFromGlobal(global_point)) is not None)
             tab_bar = self.right_tabs.tabBar()
-            on_tab_bar = tab_bar.rect().contains(tab_bar.mapFromGlobal(global_point))
+            on_tab_bar = tab_bar.isVisible() and tab_bar.rect().contains(tab_bar.mapFromGlobal(global_point))
+            if hasattr(self, "flow_page_tabs"):
+                on_tab_bar |= (self.flow_page_tabs.isVisible() and self.flow_page_tabs.rect().contains(
+                    self.flow_page_tabs.mapFromGlobal(global_point)))
             # The explicit visibility checkbox must keep its usual toggle
             # behavior; all other right-side clicks outside the axes dismiss.
             on_zoom = (watched is self.phase_zoom_controls
