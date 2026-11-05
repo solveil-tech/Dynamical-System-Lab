@@ -67,10 +67,9 @@ scalar flow direction to the reachable equilibrium. Dashed vertical connectors
 represent initial fast relaxation and loss-of-branch jumps. They do not assert
 that a finite-rate ODE solution is discontinuous.
 
-Perturbation is an explicit signed displacement used when the state is exactly
-on a repelling equilibrium. Set it to zero to retain exact invariant branches;
-the result is then flagged as unsuitable for a robust reversibility conclusion.
-Positive/negative values can select different pitchfork arms.
+The sweep uses a fixed positive perturbation of 0.001 when the state is exactly
+on a repelling equilibrium, retaining the previous default. This setting has no
+input field. At symmetric pitchforks its sign selects the positive arm.
 
 Round-trip reversibility compares the entire sampled outward and return
 branches, with tolerance 1% of the x window (minimum 0.0001). Different
@@ -78,7 +77,7 @@ attracting branches are reported as hysteresis **on the selected sweep**.
 Escape, domain boundaries or non-isolated equilibrium slices give undetermined,
 not an irreversible conclusion. This is not a proof of global reversibility.
 
-**Finite-rate** integrates `dx/dt=f(x,μ)`, `dμ/dt=±rate` with the existing adaptive
+**Finite-rate** integrates `dx/dt=f(x,μ)`, `dμ/dt=±0.1` with the existing adaptive
 Dormand–Prince solver. Curves remain continuous. A finite-rate return mismatch
 can be a rate-dependent lag and is not used to infer quasistatic hysteresis.
 Integration limits and partial paths are reported explicitly.

@@ -84,30 +84,32 @@ class BifurcationPanel(QWidget):
         layout.addWidget(box)
         box = QGroupBox("Parameter sweep (click the diagram to select μ₀, x₀)")
         grid = QGridLayout(box)
+        self._sweep_grid = grid
         self.mode, self.direction = combo_class(), combo_class()
         self.mode.addItems(["Quasistatic", "Finite-rate"])
         self.direction.addItems(["Increasing μ", "Decreasing μ"])
         self.roundtrip = QCheckBox("Round trip")
         self.roundtrip.setChecked(False)
-        self.rate = host.make_spin(0.1, 0.001, 100, 0.01, compact_decimals=True)
-        self.rate.setEnabled(False)
-        self.perturbation = host.make_spin(0.001, -1, 1, 0.001)
-        self.perturbation.setToolTip("Explicit signed perturbation when an exact equilibrium loses stability. Zero preserves invariant branches.")
         self.mu0 = host.make_spin(-1, -10000, 10000, 0.1)
         self.x0 = host.make_spin(-1.3, -10000, 10000, 0.1)
         for col, widget in enumerate((self.mode, self.direction, self.roundtrip)):
             grid.addWidget(widget, 0, col*2, 1, 2)
-        for col, (label, widget) in enumerate((("μ₀", self.mu0), ("x₀", self.x0), ("|dμ/dt|", self.rate))):
-            grid.addWidget(QLabel(label), 1, col*2)
-            grid.addWidget(widget, 1, col*2+1)
-        grid.addWidget(QLabel("Perturbation"), 2, 0)
-        grid.addWidget(self.perturbation, 2, 1)
         self.trace_btn = QPushButton("Trace sweep")
         self.trace_btn.clicked.connect(self.trace)
-        grid.addWidget(self.trace_btn, 2, 2, 1, 2)
         clear = QPushButton("Clear trace")
         clear.clicked.connect(self.clear_trace)
-        grid.addWidget(clear, 2, 4, 1, 2)
+        initial_row = QHBoxLayout()
+        initial_row.setContentsMargins(0, 0, 0, 0)
+        initial_row.setSpacing(4)
+        for label, widget in (("μ₀", self.mu0), ("x₀", self.x0)):
+            initial_row.addWidget(QLabel(label))
+            widget.setMinimumWidth(68)
+            initial_row.addWidget(widget, 1)
+        initial_row.addWidget(self.trace_btn, 1)
+        initial_row.addWidget(clear, 1)
+        grid.addLayout(initial_row, 1, 0, 1, 6)
+        saved_row_height = max(self.mu0.sizeHint().height(), self.x0.sizeHint().height(),
+                               self.trace_btn.sizeHint().height())+max(0, grid.verticalSpacing())
         layout.addWidget(box)
         row = QHBoxLayout()
         self.show_derivative = QCheckBox("Show fₓ = 0")
@@ -137,7 +139,7 @@ class BifurcationPanel(QWidget):
         self.info_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setFixedHeight(94)
+        scroll.setFixedHeight(94+saved_row_height)
         self.status = QLabel("Enter f(x, μ), then Analyze. This tab has its own equations and settings.")
         self.status.setWordWrap(True)
         information = QWidget()
@@ -151,7 +153,7 @@ class BifurcationPanel(QWidget):
         layout.addWidget(scroll)
         self.preset.currentTextChanged.connect(self._preset)
         self.formula.textChanged.connect(self._formula_changed)
-        for spin in (self.mu0, self.x0, self.rate, self.perturbation):
+        for spin in (self.mu0, self.x0):
             spin.valueChanged.connect(self.clear_trace)
         self.mode.currentTextChanged.connect(self._mode_changed)
         self.direction.currentTextChanged.connect(self.clear_trace)
@@ -299,9 +301,6 @@ class BifurcationPanel(QWidget):
             self.analysis_key = None
 
     def _mode_changed(self, _text):
-        finite = self.mode.currentIndex() == 1
-        self.rate.setEnabled(finite)
-        self.perturbation.setEnabled(not finite)
         self.clear_trace()
 
     def clear_trace(self, *_args):
@@ -324,8 +323,8 @@ class BifurcationPanel(QWidget):
             self.status.setText("The initial point must lie inside the analysis window.")
             return
         data.update(initial=initial, direction=1 if self.direction.currentIndex() == 0 else -1,
-                    roundtrip=self.roundtrip.isChecked(), rate=self.rate.value(),
-                    perturbation=self.perturbation.value(), mode="finite" if self.mode.currentIndex() else "quasistatic")
+                    roundtrip=self.roundtrip.isChecked(), rate=0.1,
+                    perturbation=0.001, mode="finite" if self.mode.currentIndex() else "quasistatic")
         self.trace_key = (self.analysis_key, tuple(sorted((k, str(v)) for k, v in data.items())))
         self.trace_result = None
         self.draw()
@@ -358,8 +357,6 @@ class BifurcationPanel(QWidget):
         if self.trace_result:
             rows.append(self.trace_result["reversibility"])
             bold_phrases.append(self.trace_result["reversibility"])
-            if self.trace_result["mode"] == "quasistatic":
-                rows.append("Quasistatic branch following; dashed connectors represent fast relaxation, not finite-time discontinuities. Perturbation applies only at loss of stability.")
         self.info.set_rows(rows, self.fg)
         bold = QTextCharFormat()
         bold.setFontWeight(QFont.Weight.Bold)
@@ -386,6 +383,11 @@ class BifurcationPanel(QWidget):
 
     def set_dark(self, dark):
         self.dark = bool(dark)
+        for widget in (self.mu0, self.x0, self.trace_btn):
+            widget.ensurePolished()
+        saved_row_height = max(self.mu0.sizeHint().height(), self.x0.sizeHint().height(),
+                               self.trace_btn.sizeHint().height())+max(0, self._sweep_grid.verticalSpacing())
+        self.info_scroll.setFixedHeight(94+saved_row_height)
         self._update_key()
         self.info_scroll.setStyleSheet(self.host.equilibrium_scroll.styleSheet())
         self._info()
