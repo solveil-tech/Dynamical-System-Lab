@@ -3412,6 +3412,13 @@ class SpeedColorButton(QToolButton):
                 painter.setBrush(color)
                 painter.drawPie(rect, angle*16, 15*16+8)
         painter.setClipping(False)
+        if self.isChecked():
+            # A subpixel raised edge, lit from the upper left, separates pale
+            # spectrum colors from the background without a heavy outline.
+            painter.fillPath(self.caption_path.translated(-.35, -.4),
+                             QBrush(QColor(255, 255, 255, 110 if self.dark else 70)))
+            painter.fillPath(self.caption_path.translated(.55, .65),
+                             QBrush(QColor(0, 0, 0, 140 if self.dark else 105)))
         painter.fillPath(self.caption_path, self.caption_gradient if self.isChecked() else
                          QBrush(QColor("#a0a0a0" if self.dark else "#777777")))
 
