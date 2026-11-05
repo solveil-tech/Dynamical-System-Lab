@@ -15,8 +15,9 @@ tabs switch workspaces. Bifurcation hides the Flow workspace's three navigation
 tabs and its action buttons, and disables the left flow controls at 50% opacity.
 Flow restores those controls and
 opens Phase portrait, keeping the previous equations and parameters.
-Phase-plot zoom buttons have a separate control row. A fixed-height speed-spectrum
-slot is reserved even when Speed colors is off, so toggling it does not move or
+The phase plot has a speed-color fan at its upper left (gray when off, colorful
+when on) and zoom buttons at its upper right. A fixed-height speed-spectrum
+slot is reserved even when speed colors are off, so toggling it does not move or
 resize the plot. During window resizing the cached background retains its aspect
 ratio and alignment with particles until the native-resolution redraw arrives.
 The phase axes are horizontally centered with equal left/right margins. The
@@ -27,6 +28,10 @@ opening a gap between it and the plot.
 Extra sidebar height is distributed evenly between the tool groups. Inputs,
 buttons and the checkbox rows retain their normal heights; shrinking the window
 restores the original compact inter-group gaps.
+Greek letters restores the previous window height after collapsing an expansion
+that automatically enlarged the window. Params shows only its title when no
+parameters occur in the equations; detected parameters appear three per row,
+defaulting to 1. Edit their values directly in those fields.
 See [BIFURCATION.md](BIFURCATION.md) for
 the scalar analysis and parameter-sweep controls.
 

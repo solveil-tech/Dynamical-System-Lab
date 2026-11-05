@@ -1528,7 +1528,9 @@ def parameters_for_equations(expressions, definitions, polar=False):
     if polar:
         reserved |= {"r", "θ", "theta"}
     names = infer_parameter_names(
-        [normalize_display_expression(text) for text in expressions], params, reserved)
+        [normalize_display_expression(text) for text in expressions], params, reserved,
+        include_unused=False)
+    params = {name: value for name, value in params.items() if name in names}
     for name in sorted(names):
         params.setdefault(name, 1.0)
     return params
@@ -3361,6 +3363,30 @@ class EquilibriumInfo(QTextEdit):
         return data
 
 
+class SpeedColorButton(QToolButton):
+    """A native, high-DPI fan symbol with an explicit monochrome off state."""
+    def __init__(self):
+        super().__init__()
+        self.setCheckable(True)
+        self.setFixedSize(32, 26)
+        self.setAccessibleName("Speed colors")
+        self.dark = False
+        self.toggled.connect(lambda _checked: self.update())
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        colors = ("#554bff", "#277fff", "#00bded", "#16c98d",
+                  "#cfda28", "#ffa123", "#ef4857")
+        for index, color in enumerate(colors):
+            painter.setBrush(QColor(color if self.isChecked() else
+                                    ("#a0a0a0" if self.dark else "#888888")))
+            painter.drawPie(QRectF(3, 7, 26, 26), round(index * 180 * 16 / 7),
+                            round((index + 1) * 180 * 16 / 7) - round(index * 180 * 16 / 7))
+
+
 class DynamicalSystemLab(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3606,11 +3632,12 @@ class DynamicalSystemLab(QMainWindow):
         self.parameter_box = QGroupBox("Params")
         parameter_layout = QVBoxLayout(self.parameter_box)
         parameter_layout.setSpacing(4)
-        self.param_input = NotationLineEdit()
-        self.param_input.setPlaceholderText("e.g. α=1, β=2")
-        self.param_input.setToolTip("Define parameters as symbol=value pairs. Edit individual values below.")
+        # Retain the serialized definitions for old experiments and presets;
+        # all visible editing now happens through the detected parameter fields.
+        self.param_input = NotationLineEdit(parent=self.parameter_box)
+        self.param_input.hide()
+        self.param_input.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.param_input.textChanged.connect(self._on_parameters_edited)
-        parameter_layout.addWidget(self.param_input)
         self.parameter_fields = QWidget()
         self.parameter_form = QGridLayout(self.parameter_fields)
         self.parameter_form.setContentsMargins(0, 0, 0, 0)
@@ -3618,8 +3645,10 @@ class DynamicalSystemLab(QMainWindow):
         self.parameter_form.setVerticalSpacing(4)
         self.parameter_form.setColumnStretch(1, 1)
         self.parameter_form.setColumnStretch(3, 1)
+        self.parameter_form.setColumnStretch(5, 1)
         self.parameter_fields.hide()
         parameter_layout.addWidget(self.parameter_fields)
+        self._set_parameter_section_visible(False)
         controls.addWidget(self.parameter_box)
 
         settings = QGroupBox("View and motion")
@@ -3691,7 +3720,7 @@ class DynamicalSystemLab(QMainWindow):
         self.show_equilibria.setChecked(False)
         self.show_equilibria.toggled.connect(self._on_equilibrium_visibility_changed)
         self.normalize.setChecked(True)
-        self.speed_color = QCheckBox("Speed colors")
+        self.speed_color = SpeedColorButton()
         self.speed_color.setToolTip(
             "Colors use the vector-field magnitude |F| on a log scale. "
             "Unit speed changes particle motion, not this magnitude."
@@ -3723,10 +3752,6 @@ class DynamicalSystemLab(QMainWindow):
         view_options.addWidget(self.show_field, 0, 0)
         view_options.addWidget(self.normalize, 0, 1)
         option_rows.addLayout(view_options)
-        visual_options = QHBoxLayout()
-        visual_options.setSpacing(12)
-        visual_options.addWidget(self.speed_color)
-        option_rows.addLayout(visual_options)
         equilibrium_options = QHBoxLayout()
         equilibrium_options.setSpacing(12)
         equilibrium_options.addWidget(self.show_equilibria)
@@ -3807,7 +3832,8 @@ class DynamicalSystemLab(QMainWindow):
         phase_layout.setContentsMargins(0, 0, 0, 0)
         phase_layout.setSpacing(2)
         phase_tools = QHBoxLayout()
-        phase_tools.setContentsMargins(0, 0, 10, 0)
+        phase_tools.setContentsMargins(10, 0, 10, 0)
+        phase_tools.addWidget(self.speed_color)
         phase_tools.addStretch(1)
         phase_tools.addWidget(self.phase_zoom_controls)
         phase_layout.addLayout(phase_tools)
@@ -4230,7 +4256,7 @@ class DynamicalSystemLab(QMainWindow):
                     rendered_name)
                 label.setText(rendered_name)
                 label.setStyleSheet("font-family:Times New Roman; font-size:12pt;")
-                row, column = index // 2, (index % 2) * 2
+                row, column = index // 3, (index % 3) * 2
                 self.parameter_form.addWidget(label, row, column)
                 self.parameter_form.addWidget(editor, row, column + 1)
                 self._parameter_editors[name] = editor
@@ -4239,7 +4265,15 @@ class DynamicalSystemLab(QMainWindow):
                 # Keep extra digits only when the raw Params value actually has them;
                 # never display a rounded value while calculating another value.
                 editor.setText(format(self.params[name], ".12g"))
-        self.parameter_fields.setVisible(bool(self.params))
+        self._set_parameter_section_visible(bool(self.params))
+
+    def _set_parameter_section_visible(self, visible):
+        self.parameter_fields.setVisible(visible)
+        self.parameter_box.setMinimumHeight(0)
+        self.parameter_box.setMaximumHeight(16777215 if visible else 24)
+        self.parameter_box.setStyleSheet("" if visible else
+            "QGroupBox {border: none; padding: 0; margin-top: 6px;}")
+        self.parameter_box.updateGeometry()
 
     def _commit_parameter_field(self, name):
         if name not in self._parameter_editors:
@@ -4587,6 +4621,8 @@ class DynamicalSystemLab(QMainWindow):
         self._two_d_only_widgets.append(label)
 
     def _apply_theme(self, dark):
+        self.speed_color.dark = dark
+        self.speed_color.update()
         background = "#000000" if dark else "#ffffff"
         foreground = "#f2f2f2" if dark else "#111111"
         secondary = "#d0d0d0" if dark else "#222222"
@@ -4995,10 +5031,11 @@ class DynamicalSystemLab(QMainWindow):
             # The explicit visibility checkbox must keep its usual toggle
             # behavior; all other right-side clicks outside the axes dismiss.
             on_zoom = (watched is self.phase_zoom_controls
-                       or self.phase_zoom_controls.isAncestorOf(watched))
+                       or self.phase_zoom_controls.isAncestorOf(watched)
+                       or watched is self.speed_color)
             if not on_controls and not on_plot and not on_tab_bar and not on_zoom and watched is not self.show_selected:
                 self._dismiss_selected_trace()
-        if event.type() == QEvent.Type.FocusIn and watched in (self.fx_input, self.fy_input, self.fz_input, self.param_input):
+        if event.type() == QEvent.Type.FocusIn and watched in (self.fx_input, self.fy_input, self.fz_input):
             self._active_calculator_editor = watched
         if watched in self._formula_history and event.type() == QEvent.Type.FocusIn:
             self._active_formula_editor = watched
@@ -5054,17 +5091,36 @@ class DynamicalSystemLab(QMainWindow):
         self.apply_model()
 
     def _toggle_greek_letters(self, expanded):
+        if expanded:
+            self._greek_restore_height = self.height()
+        restore = (not expanded and not self.isMaximized()
+                   and self.height() == max(getattr(self, "_greek_restore_height", self.height()),
+                                            self.minimumSizeHint().height()))
+        expanded_height = self.height()
         self.greek_panel.setVisible(expanded)
         self.greek_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        def settle():
+            self.sidebar_layout.activate()
+            self.centralWidget().layout().activate()
+            self.layout().activate()
+            if restore:
+                # The splitter posts another layout request before QMainWindow's
+                # minimum shrinks. Restore after that request has propagated.
+                def restore_height(attempt=0):
+                    if self.greek_toggle.isChecked() or self.height() != expanded_height:
+                        return
+                    minimum = self.minimumSizeHint().height()
+                    if minimum > self._greek_restore_height and attempt < 5:
+                        QTimer.singleShot(30, lambda: restore_height(attempt + 1))
+                        return
+                    self.resize(self.width(), max(minimum, self._greek_restore_height))
+                QTimer.singleShot(0, restore_height)
+        QTimer.singleShot(0, settle)
 
     def insert_symbol(self, value):
         focused = QApplication.focusWidget()
-        if focused in (self.fx_input, self.fy_input, self.fz_input, self.param_input):
+        if focused in (self.fx_input, self.fy_input, self.fz_input):
             self._active_calculator_editor = focused
-        if self._active_calculator_editor is self.param_input:
-            self.param_input.insert(value)
-            self.param_input.setFocus()
-            return
         if focused in (self.fx_input, self.fy_input, self.fz_input):
             self._active_formula_editor = focused
         widget = self._active_formula_editor

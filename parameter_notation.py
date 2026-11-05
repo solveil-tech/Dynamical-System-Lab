@@ -111,9 +111,9 @@ def format_parameter_definitions(text, reserved=()):
     return ",".join(items)
 
 
-def infer_parameter_names(expressions, explicit, reserved):
+def infer_parameter_names(expressions, explicit, reserved, include_unused=True):
     """Single adjacent letters multiply; declared multiletter names stay intact."""
-    names = set(explicit)
+    names = set(explicit) if include_unused else set()
     candidates = sorted(set(explicit) | set(reserved), key=len, reverse=True)
     for expression in expressions:
         source = canonicalize_parameter_notation(expression)
@@ -125,7 +125,10 @@ def infer_parameter_names(expressions, explicit, reserved):
             word = token["name"]
             if word is None:
                 continue
-            if word in reserved or word in explicit:
+            if word in reserved:
+                continue
+            if word in explicit:
+                names.add(word)
                 continue
             if "_" in word:
                 names.add(word)
@@ -139,6 +142,8 @@ def infer_parameter_names(expressions, explicit, reserved):
                     continue
                 atom = next((candidate for candidate in candidates if word.startswith(candidate, index)), None)
                 if atom:
+                    if atom in explicit:
+                        names.add(atom)
                     index += len(atom)
                     continue
                 token = re.match(rf"[{_LETTERS}][0-9]*", word[index:])
