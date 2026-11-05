@@ -2362,6 +2362,8 @@ class FlowCanvas(QOpenGLWidget):
         self.background_image = QImage()
         self.background_texture = None
         self.plot_rect = (0.10, 0.98, 0.10, 0.94)
+        self._background_source_plot_rect = self.plot_rect
+        self._background_viewport = None
         self.position_fbos, self.history_fbos = [[], []], []
         self.position_ping = 0
         self.history_cursor = self.history_latest = 0
@@ -2398,7 +2400,8 @@ class FlowCanvas(QOpenGLWidget):
     def set_background(self, background_png, plot_rect):
         self.background_image = (background_png if isinstance(background_png, QImage)
                                  else QImage.fromData(background_png, "PNG"))
-        self.plot_rect = tuple(float(v) for v in plot_rect)
+        self._background_source_plot_rect = tuple(float(v) for v in plot_rect)
+        self._fit_background_to_view()
         if self.ready:
             self.makeCurrent()
             try:
@@ -2516,11 +2519,40 @@ class FlowCanvas(QOpenGLWidget):
             self._fail(exc)
 
     def resizeGL(self, width, height):
+        self._fit_background_to_view()
         self.update()
 
     def resizeEvent(self, event):
+        self._fit_background_to_view()
         super().resizeEvent(event)
         self.canvasResized.emit()
+
+    def _fit_background_to_view(self):
+        """Keep frame and particles aligned without stretching cached pixels.
+
+        While the next native-resolution background is being prepared, place
+        the old image with one isotropic scale around the new equal-aspect axes.
+        """
+        if self.background_image.isNull():
+            return
+        size = self.size()*self.devicePixelRatioF()
+        w, h = max(1, size.width()), max(1, size.height())
+        sw, sh = self.background_image.width(), self.background_image.height()
+        left, right, bottom, top = self._background_source_plot_rect
+        if (sw, sh) == (w, h):
+            self._background_viewport = (0, 0, w, h)
+            self.plot_rect = self._background_source_plot_rect
+            return
+        aspect = (self.bounds[1]-self.bounds[0])/(self.bounds[3]-self.bounds[2])
+        pw = min(.88*w, .84*h*aspect)
+        ph = pw/aspect
+        scale = min(pw/max(1e-9, sw*(right-left)), ph/max(1e-9, sh*(top-bottom)))
+        vw, vh = max(1, round(sw*scale)), max(1, round(sh*scale))
+        vx = round(.54*w-vw*(left+right)/2)
+        vy = round(.52*h-vh*(bottom+top)/2)
+        self._background_viewport = (vx, vy, vw, vh)
+        self.plot_rect = ((vx+vw*left)/w, (vx+vw*right)/w,
+                          (vy+vh*bottom)/h, (vy+vh*top)/h)
 
     def _screen_to_view(self, position):
         left, right, bottom, top = self.plot_rect
@@ -2601,12 +2633,15 @@ class FlowCanvas(QOpenGLWidget):
         gl.glClear(self.COLOR_BIT)
         self.vao.bind()
         if self.background_texture is not None and self.background_texture.isCreated():
+            self._fit_background_to_view()
+            gl.glViewport(*self._background_viewport)
             gl.glDisable(self.BLEND)
             self.background_texture.bind(0)
             self.background_program.bind()
             self._set_uniform(self.background_program, "u_image", 0)
             gl.glDrawArrays(self.TRIANGLES, 0, 3)
             self.background_program.release()
+        gl.glViewport(0, 0, width, height)
         if self.ready:
             self._draw_trail_history(width, height)
         self.vao.release()
@@ -3403,6 +3438,10 @@ class DynamicalSystemLab(QMainWindow):
         self._static_refresh_timer.setSingleShot(True)
         self._static_refresh_timer.setInterval(140)
         self._static_refresh_timer.timeout.connect(self._refresh_static_background)
+        self._phase_resize_timer = QTimer(self)
+        self._phase_resize_timer.setSingleShot(True)
+        self._phase_resize_timer.setInterval(60)
+        self._phase_resize_timer.timeout.connect(lambda: self._refresh_static_background(resizing=True))
         self._view_settle_timer = QTimer(self)
         self._view_settle_timer.setSingleShot(True)
         self._view_settle_timer.setInterval(110)
@@ -3724,12 +3763,12 @@ class DynamicalSystemLab(QMainWindow):
         self.flow_canvas.gpuStatus.connect(self._on_gpu_status)
         self.flow_canvas.viewChanged.connect(self._on_canvas_view_changed)
         self.flow_canvas.initialPointPicked.connect(self._pick_initial_point)
-        self.flow_canvas.canvasResized.connect(lambda: self._static_refresh_timer.start())
+        self.flow_canvas.canvasResized.connect(self._on_phase_canvas_resized)
         self.view_stack = QStackedWidget()
         self.view_stack.addWidget(self.flow_canvas)
         self.canvas3d = Flow3DCanvas()
         self.view_stack.addWidget(self.canvas3d)
-        self.phase_zoom_controls = QWidget(self.view_stack)
+        self.phase_zoom_controls = QWidget()
         zoom_layout = QHBoxLayout(self.phase_zoom_controls)
         zoom_layout.setContentsMargins(0, 0, 0, 0)
         zoom_layout.setSpacing(4)
@@ -3743,19 +3782,21 @@ class DynamicalSystemLab(QMainWindow):
             button.clicked.connect(lambda _checked=False, scale=factor: self._zoom_phase_view(scale))
             zoom_layout.addWidget(button)
         self.phase_zoom_controls.adjustSize()
-        self.view_stack.installEventFilter(self)
-        self.view_stack.currentChanged.connect(lambda _index: self.phase_zoom_controls.raise_())
         self.right_tabs = QTabWidget()
         phase_page = QWidget()
         phase_layout = QVBoxLayout(phase_page)
         phase_layout.setContentsMargins(0, 0, 0, 0)
+        phase_tools = QHBoxLayout()
+        phase_tools.setContentsMargins(0, 0, 10, 0)
+        phase_tools.addStretch(1)
+        phase_tools.addWidget(self.phase_zoom_controls)
+        phase_layout.addLayout(phase_tools)
         phase_layout.addWidget(self.view_stack, 1)
         self.speed_legend = QLabel()
         self.speed_legend.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.speed_legend.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.speed_legend.setMinimumWidth(0)
         self.speed_legend.setFixedHeight(44)
-        self.speed_legend.hide()
         phase_layout.addWidget(self.speed_legend)
         self.right_tabs.addTab(phase_page, "Phase portrait")
         self._build_experience_tabs()
@@ -4185,8 +4226,9 @@ class DynamicalSystemLab(QMainWindow):
 
     def _update_speed_legend(self, plot_rect=None):
         enabled = self.speed_color.isChecked()
-        self.speed_legend.setVisible(enabled)
         if not enabled:
+            self.speed_legend.clear()
+            self._speed_legend_signature = None
             return
         maximum = self._speed_max
         if self._dimension == "3D" and len(self.canvas3d.trajectory):
@@ -4855,11 +4897,6 @@ class DynamicalSystemLab(QMainWindow):
             [normalize_display_expression(text) for text in expressions], names, reserved)
 
     def eventFilter(self, watched, event):
-        if (watched is getattr(self, "view_stack", None)
-                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
-            controls = self.phase_zoom_controls
-            controls.move(max(0, watched.width()-controls.width()-12), 12)
-            controls.raise_()
         if watched is getattr(self, "speed_legend", None) and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._update_speed_legend)
         if event.type() == QEvent.Type.ToolTip and watched in (self.flow_canvas, self.canvas3d.canvas):
@@ -5272,6 +5309,7 @@ class DynamicalSystemLab(QMainWindow):
 
     def closeEvent(self, event):
         self.bifurcation_panel.close_workers()
+        self._phase_resize_timer.stop()
         self._auto_apply_timer.stop()
         self._static_refresh_timer.stop()
         self._view_settle_timer.stop()
@@ -5447,11 +5485,16 @@ class DynamicalSystemLab(QMainWindow):
         self._static_refresh_timer.stop()
         self._refresh_static_background(final=True)
 
-    def _refresh_static_background(self, final=False):
+    def _on_phase_canvas_resized(self):
+        if not self._phase_resize_timer.isActive():
+            self._phase_resize_timer.start()
+        self._static_refresh_timer.start(180)
+
+    def _refresh_static_background(self, final=False, resizing=False):
         if not self._model_applied or self._dimension != "2D" or not self._last_apply_valid:
             return
         try:
-            interactive = self._view_settle_timer.isActive() and not final
+            interactive = resizing or (self._view_settle_timer.isActive() and not final)
             if not interactive:
                 self._update_equilibrium_info(self._active_bounds)
                 self._request_periodic_orbits()
