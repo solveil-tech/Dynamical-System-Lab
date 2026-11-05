@@ -14,7 +14,8 @@ existing behavior. Existing experiment files do not include this tab's settings.
    Nonsmooth absolute-value, sign, floor and piecewise systems are explicitly
    excluded from this first classical bifurcation analysis; the original phase
    portrait's absolute-value support is unaffected.
-2. Set the μ and x ranges. Analyze draws `f = 0`, an optional `f_x = 0`
+2. Choose a model or enter f on the same row, then set the μ and x ranges.
+   Analysis updates automatically and draws `f = 0`, an optional `f_x = 0`
    locus, and the isolated intersections. Manual zoom synchronizes the range
    controls and analyzes the visible region after a short pause. Views within
    completed or pending coverage reuse that search; expansion searches the union
@@ -27,7 +28,9 @@ existing behavior. Existing experiment files do not include this tab's settings.
    Trace sweep. Round trip reverses at the chosen range endpoint and returns
    to μ₀. Purple denotes the outward leg; green denotes the return leg.
 
-The color key, mathematical conclusions and status messages share a compact,
+The graphical legend shows actual colored line styles and a critical-point dot,
+with short labels. It replaces descriptions of colors and dash patterns.
+The legend, mathematical conclusions and status messages share a compact,
 fixed-height scroll area with the same scrollbar styling as Flow. Long analysis
 text scrolls there without reducing the graph. The hidden Bifurcation page does
 not increase the Flow workspace's minimum window size.

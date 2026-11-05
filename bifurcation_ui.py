@@ -2,10 +2,10 @@
 import re
 import math
 import numpy as np
-from PySide6.QtCore import QTimer, QSignalBlocker, Qt
-from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QTimer, QSignalBlocker, Qt, QPointF
+from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QGridLayout, QHBoxLayout,
-    QGroupBox, QLabel, QPushButton, QCheckBox, QScrollArea, QFrame, QFileDialog)
+    QGroupBox, QLabel, QPushButton, QCheckBox, QScrollArea, QFrame, QFileDialog, QSizePolicy)
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.collections import LineCollection
@@ -31,6 +31,67 @@ def continuous_paths(segments):
         else:
             paths.append(list(segment))
     return [np.asarray(path) for path in paths]
+
+
+class LegendSample(QWidget):
+    def __init__(self, style):
+        super().__init__()
+        self.style = style
+        self.color = "#222222"
+        self.setFixedSize(28, 18)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self.style is None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(self.color))
+            painter.drawEllipse(QPointF(14, 9), 3.2, 3.2)
+        else:
+            painter.setPen(QPen(QColor(self.color), 1.7, self.style))
+            painter.drawLine(QPointF(1, 9), QPointF(27, 9))
+
+
+class BifurcationLegend(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(2)
+        self.entries = {}
+        definitions = [
+            ("stable", "Stable", Qt.PenStyle.SolidLine),
+            ("unstable", "Unstable", Qt.PenStyle.DashLine),
+            ("semistable", "Semistable", Qt.PenStyle.DashDotLine),
+            ("inconclusive", "Inconclusive", Qt.PenStyle.SolidLine),
+            ("derivative", "fₓ = 0", Qt.PenStyle.DotLine),
+            ("critical", "Critical point", None),
+            ("outward", "Outward", Qt.PenStyle.SolidLine),
+            ("return", "Return", Qt.PenStyle.SolidLine),
+            ("jump", "Jump / relaxation", Qt.PenStyle.DashLine),
+        ]
+        for index, (key, title, style) in enumerate(definitions):
+            sample, label = LegendSample(style), QLabel(title)
+            entry = QHBoxLayout()
+            entry.setContentsMargins(0, 0, 0, 0)
+            entry.setSpacing(4)
+            entry.addWidget(sample)
+            entry.addWidget(label)
+            entry.addStretch(1)
+            layout.addLayout(entry, index//3, index%3)
+            self.entries[key] = (sample, label)
+        for column in range(3):
+            layout.setColumnStretch(column, 1)
+
+    def set_colors(self, blue, red):
+        colors = dict(stable=blue, unstable=red, semistable="#e29834",
+                      inconclusive="#e29834", derivative="#999999", critical="#e35b25",
+                      outward="#c0429b", **{"return": "#219c79", "jump": "#c0429b"})
+        for key, (sample, label) in self.entries.items():
+            sample.color = colors[key]
+            sample.update()
+            label.setStyleSheet("" if key == "derivative" else f"color: {colors[key]};")
 
 
 class BifurcationPanel(QWidget):
@@ -59,32 +120,38 @@ class BifurcationPanel(QWidget):
         layout.setContentsMargins(10, 8, 10, 8)
         box = QGroupBox("Scalar system  dx/dt = f(x, μ)")
         grid = QGridLayout(box)
+        self._scalar_grid = grid
         self.preset = combo_class()
         self.preset.addItems(["Custom"]+list(PRESETS))
         self.preset.setCurrentText("Hysteresis (two folds)")
         self.formula = editor_class()
         self.formula.setText(formatter("μ+x-x^3", {"μ"}))
         self.formula.setToolTip("Use x and μ (or mu), implicit products and powers. Classical bifurcation classification requires a smooth scalar model.")
-        self.analyze_btn = QPushButton("Analyze")
-        self.analyze_btn.clicked.connect(self.analyze)
-        grid.addWidget(QLabel("Model"), 0, 0)
-        grid.addWidget(self.preset, 0, 1, 1, 3)
-        grid.addWidget(self.analyze_btn, 0, 4, 1, 2)
-        grid.addWidget(QLabel("f(x, μ) ="), 1, 0)
-        grid.addWidget(self.formula, 1, 1, 1, 5)
+        self.preset.setFixedWidth(150)
+        self.preset.setToolTip(self.preset.currentText())
+        equation_row = QHBoxLayout()
+        equation_row.setContentsMargins(0, 0, 0, 0)
+        equation_row.setSpacing(6)
+        equation_row.addWidget(QLabel("Model"))
+        equation_row.addWidget(self.preset)
+        equation_row.addWidget(QLabel("f(x, μ) ="))
+        self.formula.setMinimumWidth(0)
+        self.formula.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        equation_row.addWidget(self.formula, 1)
+        grid.addLayout(equation_row, 0, 0, 1, 6)
         self.bounds = []
         for i, (label, value) in enumerate((("μ min", -2), ("μ max", 2), ("x min", -2.5), ("x max", 2.5))):
             spin = host.make_spin(value, -10000, 10000, 0.1)
             spin.setMinimumWidth(60)
             self.bounds.append(spin)
-            grid.addWidget(QLabel(label), 2+i//2, 3*(i%2))
+            grid.addWidget(QLabel(label), 1+i//2, 3*(i%2))
             field_slot = QWidget()
             field_layout = QHBoxLayout(field_slot)
             field_layout.setContentsMargins(0, 0, 0, 0)
             field_layout.setSpacing(0)
             field_layout.addWidget(spin, 3)
             field_layout.addStretch(1)
-            grid.addWidget(field_slot, 2+i//2, 3*(i%2)+1, 1, 2)
+            grid.addWidget(field_slot, 1+i//2, 3*(i%2)+1, 1, 2)
             spin.valueChanged.connect(self._changed)
         self._home_bounds = tuple(spin.value() for spin in self.bounds)
         layout.addWidget(box)
@@ -132,10 +199,8 @@ class BifurcationPanel(QWidget):
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.ax = self.figure.add_subplot(111)
         layout.addWidget(self.canvas, 1)
-        self.key_label = QLabel()
-        self.key_label.setTextFormat(Qt.TextFormat.RichText)
+        self.legend = BifurcationLegend()
         self._update_key()
-        self.key_label.setWordWrap(True)
         class ScrollInformation(info_class):
             def _fit_height(self, size):
                 self.setFixedHeight(max(24, math.ceil(size.height())+6))
@@ -145,13 +210,13 @@ class BifurcationPanel(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setFixedHeight(94+saved_row_height)
-        self.status = QLabel("Enter f(x, μ), then Analyze. This tab has its own equations and settings.")
+        self.status = QLabel("Equations and ranges update automatically.")
         self.status.setWordWrap(True)
         information = QWidget()
         info_layout = QVBoxLayout(information)
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(4)
-        info_layout.addWidget(self.key_label)
+        info_layout.addWidget(self.legend)
         info_layout.addWidget(self.info)
         info_layout.addWidget(self.status)
         scroll.setWidget(information)
@@ -177,6 +242,7 @@ class BifurcationPanel(QWidget):
         self.canvas.setMinimumHeight(0)
 
     def _preset(self, name):
+        self.preset.setToolTip(name)
         if name in PRESETS:
             self.formula.setText(PRESETS[name])
 
@@ -194,6 +260,7 @@ class BifurcationPanel(QWidget):
             blocker = QSignalBlocker(self.preset)
             self.preset.setCurrentText("Custom")
             del blocker
+            self.preset.setToolTip("Custom")
         self._changed()
 
     def _changed(self, *_args):
@@ -315,7 +382,7 @@ class BifurcationPanel(QWidget):
         if self.view_debounce.isActive():
             self._analyze_view()
         if self.result is None:
-            self.status.setText("Analyze the current formula successfully before tracing.")
+            self.status.setText("Wait for the current formula to finish analysis before tracing.")
             return
         data = self.configuration()
         initial = (self.mu0.value(), self.x0.value())
@@ -373,14 +440,7 @@ class BifurcationPanel(QWidget):
     def _update_key(self):
         blue = "#80cfff" if self.dark else "#2453a5"
         red = "#ff7272" if self.dark else "#ca4040"
-        self.key_label.setText(
-            f'<span style="color:{blue}">Blue solid: stable</span>&nbsp;&nbsp; '
-            f'<span style="color:{red}">Red dashed: unstable</span>&nbsp;&nbsp; '
-            '<span style="color:#e29834">Orange: semistable / inconclusive</span>&nbsp;&nbsp; '
-            'Gray dotted: fₓ = 0<br>'
-            '<span style="color:#c0429b">Purple: outward sweep</span>&nbsp;&nbsp; '
-            '<span style="color:#219c79">Green: return sweep</span>&nbsp;&nbsp; '
-            '<span style="color:#c0429b">Dashed sweep connectors: jumps / fast relaxation</span>')
+        self.legend.set_colors(blue, red)
 
     def set_dark(self, dark):
         self.dark = bool(dark)
@@ -388,7 +448,8 @@ class BifurcationPanel(QWidget):
             widget.ensurePolished()
         saved_row_height = max(self.mu0.sizeHint().height(), self.x0.sizeHint().height(),
                                self.trace_btn.sizeHint().height())+max(0, self._sweep_grid.verticalSpacing())
-        self.info_scroll.setFixedHeight(94+saved_row_height)
+        removed_equation_row = max(self.preset.sizeHint().height(), self.trace_btn.sizeHint().height())+max(0, self._scalar_grid.verticalSpacing())
+        self.info_scroll.setFixedHeight(94+saved_row_height+removed_equation_row)
         self._update_key()
         self.info_scroll.setStyleSheet(self.host.equilibrium_scroll.styleSheet())
         self._info()
