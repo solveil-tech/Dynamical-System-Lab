@@ -13,6 +13,9 @@ Install Python and the packages in `requirements.txt`, then double-click
 Dark mode is beside the application title. The upper-right Flow / Bifurcation
 tabs switch workspaces. Bifurcation hides the Flow workspace's three navigation
 tabs and its action buttons, and disables the left flow controls at 50% opacity.
+Hidden actions retain their layout space, so switching workspaces does not move
+the sidebar controls or change their spacing. Both workspaces share the same
+minimum window size.
 Flow restores those controls and
 opens Phase portrait, keeping the previous equations and parameters.
 The phase plot has a borderless palette wheel at its upper left (grayscale when

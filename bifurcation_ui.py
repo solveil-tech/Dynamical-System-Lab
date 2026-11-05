@@ -185,19 +185,22 @@ class BifurcationPanel(QWidget):
         equation_row.addWidget(self.formula, 1)
         grid.addLayout(equation_row, 0, 0, 1, 6)
         self.bounds = []
-        for i, (label, value) in enumerate((("μ min", -2), ("μ max", 2), ("x min", -2.5), ("x max", 2.5))):
+        bounds_row = QHBoxLayout()
+        bounds_row.setContentsMargins(0, 0, 0, 0)
+        bounds_row.setSpacing(6)
+        self.bound_labels = []
+        for symbol, bound, value in (("μ", "min", -2), ("μ", "max", 2),
+                                     ("x", "min", -2.5), ("x", "max", 2.5)):
             spin = host.make_spin(value, -10000, 10000, 0.1)
             spin.setMinimumWidth(60)
             self.bounds.append(spin)
-            grid.addWidget(QLabel(label), 1+i//2, 3*(i%2))
-            field_slot = QWidget()
-            field_layout = QHBoxLayout(field_slot)
-            field_layout.setContentsMargins(0, 0, 0, 0)
-            field_layout.setSpacing(0)
-            field_layout.addWidget(spin, 3)
-            field_layout.addStretch(1)
-            grid.addWidget(field_slot, 1+i//2, 3*(i%2)+1, 1, 2)
+            label = QLabel(f"{symbol}<sub>{bound}</sub>")
+            label.setTextFormat(Qt.TextFormat.RichText)
+            self.bound_labels.append(label)
+            bounds_row.addWidget(label)
+            bounds_row.addWidget(spin, 1)
             spin.valueChanged.connect(self._changed)
+        grid.addLayout(bounds_row, 1, 0, 1, 6)
         self._home_bounds = tuple(spin.value() for spin in self.bounds)
         layout.addWidget(box)
         box = QGroupBox("Parameter sweep (click the diagram to select μ₀, x₀)")
@@ -285,7 +288,7 @@ class BifurcationPanel(QWidget):
         self.draw(reset=True)
 
     def activate(self):
-        self.canvas.setMinimumHeight(220)
+        self.canvas.setMinimumHeight(200)
         if not self.initialized:
             self.initialized = True
             self.analyze()

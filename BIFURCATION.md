@@ -15,6 +15,7 @@ existing behavior. Existing experiment files do not include this tab's settings.
    excluded from this first classical bifurcation analysis; the original phase
    portrait's absolute-value support is unaffected.
 2. Choose a model or enter f on the same row, then set the μ and x ranges.
+   The four range inputs share one row, with min/max rendered as subscripts.
    Analysis updates automatically and draws `f = 0`, an optional `f_x = 0`
    locus, and the isolated intersections. Manual zoom synchronizes the range
    controls and analyzes the visible region after a short pause. Views within

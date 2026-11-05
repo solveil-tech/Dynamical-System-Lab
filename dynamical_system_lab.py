@@ -3803,6 +3803,10 @@ class DynamicalSystemLab(QMainWindow):
         self.status.setStyleSheet("color: #666666; padding: 5px 2px;")
         controls.addWidget(self.status)
         self._configure_sidebar_spacing(controls)
+        # Keep sidebar geometry identical when Bifurcation hides the actions.
+        action_policy = self.flow_actions.sizePolicy()
+        action_policy.setRetainSizeWhenHidden(True)
+        self.flow_actions.setSizePolicy(action_policy)
         self.flow_opacity = QGraphicsOpacityEffect(self.flow_controls)
         self.flow_opacity.setOpacity(0.5)
         self.flow_opacity.setEnabled(False)
@@ -3967,7 +3971,8 @@ class DynamicalSystemLab(QMainWindow):
 
     def _sync_sidebar_spacing(self):
         for index, gap, following in self._sidebar_gaps:
-            active = following is None or not following.isHidden()
+            active = (following is None or not following.isHidden()
+                      or following.sizePolicy().retainSizeWhenHidden())
             gap.changeSize(0, 2 if active else 0, QSizePolicy.Policy.Minimum,
                            QSizePolicy.Policy.MinimumExpanding if active else QSizePolicy.Policy.Fixed)
             self.sidebar_layout.setStretch(index, 1 if active else 0)
