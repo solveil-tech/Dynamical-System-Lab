@@ -1,5 +1,6 @@
 """Independent scalar bifurcation tab using the application's native styles."""
 import re
+import math
 import numpy as np
 from PySide6.QtCore import QTimer, QSignalBlocker, Qt
 from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor
@@ -128,18 +129,26 @@ class BifurcationPanel(QWidget):
         self.key_label.setTextFormat(Qt.TextFormat.RichText)
         self._update_key()
         self.key_label.setWordWrap(True)
-        layout.addWidget(self.key_label)
-        self.info = info_class()
+        class ScrollInformation(info_class):
+            def _fit_height(self, size):
+                self.setFixedHeight(max(24, math.ceil(size.height())+6))
+        self.info = ScrollInformation()
         scroll = QScrollArea()
         self.info_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setFixedHeight(114)
-        scroll.setWidget(self.info)
-        layout.addWidget(scroll)
+        scroll.setFixedHeight(94)
         self.status = QLabel("Enter f(x, μ), then Analyze. This tab has its own equations and settings.")
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        information = QWidget()
+        info_layout = QVBoxLayout(information)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(4)
+        info_layout.addWidget(self.key_label)
+        info_layout.addWidget(self.info)
+        info_layout.addWidget(self.status)
+        scroll.setWidget(information)
+        layout.addWidget(scroll)
         self.preset.currentTextChanged.connect(self._preset)
         self.formula.textChanged.connect(self._formula_changed)
         for spin in (self.mu0, self.x0, self.rate, self.perturbation):
@@ -153,9 +162,13 @@ class BifurcationPanel(QWidget):
         self.draw(reset=True)
 
     def activate(self):
+        self.canvas.setMinimumHeight(220)
         if not self.initialized:
             self.initialized = True
             self.analyze()
+
+    def deactivate(self):
+        self.canvas.setMinimumHeight(0)
 
     def _preset(self, name):
         if name in PRESETS:

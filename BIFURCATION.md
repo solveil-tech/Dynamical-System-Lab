@@ -27,6 +27,11 @@ existing behavior. Existing experiment files do not include this tab's settings.
    Trace sweep. Round trip reverses at the chosen range endpoint and returns
    to μ₀. Purple denotes the outward leg; green denotes the return leg.
 
+The color key, mathematical conclusions and status messages share a compact,
+fixed-height scroll area with the same scrollbar styling as Flow. Long analysis
+text scrolls there without reducing the graph. The hidden Bifurcation page does
+not increase the Flow workspace's minimum window size.
+
 ## Classification and stability
 
 The solver uses the existing restricted AST, not evaluation of user Python.

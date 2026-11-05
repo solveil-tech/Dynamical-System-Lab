@@ -99,7 +99,7 @@ FUNCTIONS = {
 }
 
 PHASE_TOP_MARGIN = 32
-PHASE_BOTTOM_MARGIN = 42
+PHASE_BOTTOM_MARGIN = 34
 
 LATEX_SYMBOLS = {
     r"\alpha": "α", r"\beta": "β", r"\gamma": "γ", r"\delta": "δ",
@@ -3774,6 +3774,7 @@ class DynamicalSystemLab(QMainWindow):
         plot_panel.setMinimumWidth(500)
         plot_layout = QVBoxLayout(plot_panel)
         plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(0)
         self.flow_canvas = FlowCanvas()
         self.flow_canvas.gpuStatus.connect(self._on_gpu_status)
         self.flow_canvas.viewChanged.connect(self._on_canvas_view_changed)
@@ -3876,6 +3877,8 @@ class DynamicalSystemLab(QMainWindow):
                 self.flow_page_tabs.setCurrentIndex(index)
                 del blocker
             self._set_bifurcation_mode(active)
+            if not active:
+                self.bifurcation_panel.deactivate()
             equilibrium_box.setVisible(not active)
             if active:
                 self.bifurcation_panel.activate()
@@ -5453,8 +5456,8 @@ class DynamicalSystemLab(QMainWindow):
         ax.grid(True, color=grid_color, alpha=0.10, linestyle="-")
         ax.axhline(0, color=secondary, linewidth=0.55, alpha=0.28)
         ax.axvline(0, color=secondary, linewidth=0.55, alpha=0.28)
-        ax.set_xlabel("x", color=primary, labelpad=8)
-        ax.set_ylabel("y", color=primary, labelpad=8)
+        ax.set_xlabel("x", color=primary, labelpad=2)
+        ax.set_ylabel("y", color=primary, labelpad=2)
         ax.set_title("PHASE FLOW", color=primary, pad=8, fontsize=10, fontweight="bold")
         figure.subplots_adjust(left=0.10, right=0.90,
             bottom=PHASE_BOTTOM_MARGIN*ratio/pixel_height,
