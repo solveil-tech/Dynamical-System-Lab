@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QFormLayout, QGroupBox, QLabel, QLineEdit,
     QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox,
     QSplitter, QAbstractSpinBox, QComboBox, QStackedWidget, QSizePolicy, QFrame, QScrollArea,
-    QTabWidget, QTabBar, QFileDialog, QTextEdit, QToolButton, QGraphicsOpacityEffect,
+    QTabWidget, QTabBar, QFileDialog, QTextEdit, QToolButton, QGraphicsOpacityEffect, QSpacerItem,
     QProxyStyle, QStyle, QStyleOption, QStyleOptionComboBox,
 )
 
@@ -3714,20 +3714,25 @@ class DynamicalSystemLab(QMainWindow):
         for spin in (self.xmin, self.xmax, self.ymin, self.ymax):
             spin.valueChanged.connect(self._bounds_changed_from_controls)
         self.show_field.toggled.connect(lambda _value: self._static_refresh_timer.start(120))
+        self.flow_options = QWidget()
+        option_rows = QVBoxLayout(self.flow_options)
+        option_rows.setContentsMargins(0, 0, 0, 0)
+        option_rows.setSpacing(2)
         view_options = QGridLayout()
         view_options.setHorizontalSpacing(8)
         view_options.addWidget(self.show_field, 0, 0)
         view_options.addWidget(self.normalize, 0, 1)
-        controls.addLayout(view_options)
+        option_rows.addLayout(view_options)
         visual_options = QHBoxLayout()
         visual_options.setSpacing(12)
         visual_options.addWidget(self.speed_color)
-        controls.addLayout(visual_options)
+        option_rows.addLayout(visual_options)
         equilibrium_options = QHBoxLayout()
         equilibrium_options.setSpacing(12)
         equilibrium_options.addWidget(self.show_equilibria)
         equilibrium_options.addWidget(self.show_nullclines)
-        controls.addLayout(equilibrium_options)
+        option_rows.addLayout(equilibrium_options)
+        controls.addWidget(self.flow_options)
 
         self.flow_actions = QWidget()
         buttons = QGridLayout(self.flow_actions)
@@ -3759,7 +3764,7 @@ class DynamicalSystemLab(QMainWindow):
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color: #666666; padding: 5px 2px;")
         controls.addWidget(self.status)
-        controls.addStretch()
+        self._configure_sidebar_spacing(controls)
         self.flow_opacity = QGraphicsOpacityEffect(self.flow_controls)
         self.flow_opacity.setOpacity(0.5)
         self.flow_opacity.setEnabled(False)
@@ -3895,9 +3900,36 @@ class DynamicalSystemLab(QMainWindow):
             self.stop_animation()
             self.status.setText("Paused.")
         self.flow_actions.setVisible(not active)
+        self._sync_sidebar_spacing()
         self.flow_controls.setEnabled(not active)
         self.flow_opacity.setEnabled(active)
         self.flow_page_tabs.setVisible(not active)
+
+    def _configure_sidebar_spacing(self, layout):
+        self.sidebar_layout = layout
+        items = [layout.takeAt(0) for _ in range(layout.count())]
+        layout.setSpacing(0)
+        self._sidebar_gaps = []
+        for index, item in enumerate(items):
+            widget = item.widget()
+            if index:
+                gap = QSpacerItem(0, 2, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.MinimumExpanding)
+                layout.addSpacerItem(gap)
+                gap_index = layout.count()-1
+                layout.setStretch(gap_index, 1)
+                self._sidebar_gaps.append((gap_index, gap, widget))
+            if widget is not None:
+                widget.setSizePolicy(widget.sizePolicy().horizontalPolicy(), QSizePolicy.Policy.Maximum)
+            layout.addItem(item)
+        self._sync_sidebar_spacing()
+
+    def _sync_sidebar_spacing(self):
+        for index, gap, following in self._sidebar_gaps:
+            active = following is None or not following.isHidden()
+            gap.changeSize(0, 2 if active else 0, QSizePolicy.Policy.Minimum,
+                           QSizePolicy.Policy.MinimumExpanding if active else QSizePolicy.Policy.Fixed)
+            self.sidebar_layout.setStretch(index, 1 if active else 0)
+        self.sidebar_layout.invalidate()
 
     def _build_experience_tabs(self):
         page = QWidget()

@@ -24,6 +24,9 @@ window opens at its minimum layout size and can be resized freely in either
 direction. Compact, fixed plot margins keep the title, zoom controls and speed
 spectrum close to the frame; extra height stays below the spectrum instead of
 opening a gap between it and the plot.
+Extra sidebar height is distributed evenly between the tool groups. Inputs,
+buttons and the checkbox rows retain their normal heights; shrinking the window
+restores the original compact inter-group gaps.
 See [BIFURCATION.md](BIFURCATION.md) for
 the scalar analysis and parameter-sweep controls.
 
