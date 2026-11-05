@@ -59,7 +59,10 @@ class BifurcationLegend(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(2)
+        self.grid = layout
         self.entries = {}
+        self.entry_widgets = {}
+        self._visible_keys = None
         definitions = [
             ("stable", "Stable", Qt.PenStyle.SolidLine),
             ("unstable", "Unstable", Qt.PenStyle.DashLine),
@@ -73,16 +76,30 @@ class BifurcationLegend(QWidget):
         ]
         for index, (key, title, style) in enumerate(definitions):
             sample, label = LegendSample(style), QLabel(title)
-            entry = QHBoxLayout()
+            container = QWidget()
+            entry = QHBoxLayout(container)
             entry.setContentsMargins(0, 0, 0, 0)
             entry.setSpacing(4)
             entry.addWidget(sample)
             entry.addWidget(label)
             entry.addStretch(1)
-            layout.addLayout(entry, index//3, index%3)
+            layout.addWidget(container, index//3, index%3)
             self.entries[key] = (sample, label)
+            self.entry_widgets[key] = container
         for column in range(3):
             layout.setColumnStretch(column, 1)
+
+    def set_trace_entries(self, outward=False, returning=False, jump=False):
+        trace = {"outward": outward, "return": returning, "jump": jump}
+        visible = tuple(key for key in self.entry_widgets if trace.get(key, True))
+        if visible == self._visible_keys:
+            return
+        self._visible_keys = visible
+        for key, widget in self.entry_widgets.items():
+            self.grid.removeWidget(widget)
+            widget.setVisible(key in visible)
+        for index, key in enumerate(visible):
+            self.grid.addWidget(self.entry_widgets[key], index//3, index%3)
 
     def set_colors(self, blue, red):
         colors = dict(stable=blue, unstable=red, semistable="#e29834",
@@ -441,6 +458,16 @@ class BifurcationPanel(QWidget):
         blue = "#80cfff" if self.dark else "#2453a5"
         red = "#ff7272" if self.dark else "#ca4040"
         self.legend.set_colors(blue, red)
+        self._sync_trace_legend()
+
+    def _sync_trace_legend(self):
+        result = self.trace_result or {}
+        drawn_legs = {leg for leg, path in zip(result.get("segment_legs", []),
+                      result.get("segments", [])) if len(path) >= 2}
+        self.legend.set_trace_entries(
+            outward=0 in drawn_legs,
+            returning=self.roundtrip.isChecked() and 1 in drawn_legs,
+            jump=bool(result.get("jumps", [])))
 
     def set_dark(self, dark):
         self.dark = bool(dark)
@@ -456,6 +483,7 @@ class BifurcationPanel(QWidget):
         self.draw()
 
     def draw(self, reset=False):
+        self._sync_trace_legend()
         self._drawing = True
         limits = (self.ax.get_xlim(), self.ax.get_ylim())
         self.ax.clear()

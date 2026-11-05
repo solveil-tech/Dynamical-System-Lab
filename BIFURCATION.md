@@ -30,6 +30,8 @@ existing behavior. Existing experiment files do not include this tab's settings.
 
 The graphical legend shows actual colored line styles and a critical-point dot,
 with short labels. It replaces descriptions of colors and dash patterns.
+Outward, return and jump entries appear only for generated sweep paths. Return
+additionally requires Round trip; clearing the trace hides all sweep entries.
 The legend, mathematical conclusions and status messages share a compact,
 fixed-height scroll area with the same scrollbar styling as Flow. Long analysis
 text scrolls there without reducing the graph. The hidden Bifurcation page does
