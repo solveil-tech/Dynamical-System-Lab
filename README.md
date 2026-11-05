@@ -15,8 +15,8 @@ tabs switch workspaces. Bifurcation hides the Flow workspace's three navigation
 tabs and its action buttons, and disables the left flow controls at 50% opacity.
 Flow restores those controls and
 opens Phase portrait, keeping the previous equations and parameters.
-The phase plot has a speed-color fan at its upper left (gray when off, colorful
-when on) and zoom buttons at its upper right. A fixed-height speed-spectrum
+The phase plot has a borderless palette wheel at its upper left (grayscale when
+off, colorful when on) and zoom buttons at its upper right. A fixed-height speed-spectrum
 slot is reserved even when speed colors are off, so toggling it does not move or
 resize the plot. During window resizing the cached background retains its aspect
 ratio and alignment with particles until the native-resolution redraw arrives.

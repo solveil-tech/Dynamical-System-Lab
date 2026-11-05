@@ -32,7 +32,7 @@ from PySide6.QtGui import (
     QFont, QFontDatabase, QImage, QPixmap, QPainter, QSurfaceFormat, QVector4D,
     QColor, QRawFont, QGlyphRun, QPyTextObject, QTextFormat,
     QTextCharFormat, QTextCursor, QTextBlockFormat,
-    QSyntaxHighlighter,
+    QSyntaxHighlighter, QPainterPath,
 )
 from PySide6.QtOpenGL import (
     QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat,
@@ -3364,27 +3364,40 @@ class EquilibriumInfo(QTextEdit):
 
 
 class SpeedColorButton(QToolButton):
-    """A native, high-DPI fan symbol with an explicit monochrome off state."""
+    """Vector palette wheel; the off state preserves its pattern in grayscale."""
     def __init__(self):
         super().__init__()
         self.setCheckable(True)
         self.setFixedSize(32, 26)
         self.setAccessibleName("Speed colors")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("QToolButton {border: none; background: transparent; padding: 0;}")
         self.dark = False
         self.toggled.connect(lambda _checked: self.update())
 
     def paintEvent(self, event):
-        super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        colors = ("#554bff", "#277fff", "#00bded", "#16c98d",
-                  "#cfda28", "#ffa123", "#ef4857")
-        for index, color in enumerate(colors):
-            painter.setBrush(QColor(color if self.isChecked() else
-                                    ("#a0a0a0" if self.dark else "#888888")))
-            painter.drawPie(QRectF(3, 7, 26, 26), round(index * 180 * 16 / 7),
-                            round((index + 1) * 180 * 16 / 7) - round(index * 180 * 16 / 7))
+        center, radius, hole = QPointF(16, 13), 11.5, 2.8
+        clip = QPainterPath()
+        clip.setFillRule(Qt.FillRule.OddEvenFill)
+        clip.addEllipse(center, radius, radius)
+        clip.addEllipse(center, hole, hole)
+        painter.setClipPath(clip)
+        # Concentric tonal bands and hue sectors echo a printed palette wheel.
+        for ring in range(5, -1, -1):
+            outer = hole + (radius-hole)*(ring+1)/6
+            rect = QRectF(center.x()-outer, center.y()-outer, 2*outer, 2*outer)
+            for sector in range(24):
+                angle = sector*15
+                color = QColor.fromHsvF(((150-angle-7.5) % 360)/360,
+                                        .24+.13*ring, 1-.035*ring)
+                if not self.isChecked():
+                    gray = round(.299*color.red()+.587*color.green()+.114*color.blue())
+                    color = QColor(gray, gray, gray)
+                painter.setBrush(color)
+                painter.drawPie(rect, angle*16, 15*16+8)
 
 
 class DynamicalSystemLab(QMainWindow):

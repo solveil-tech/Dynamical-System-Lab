@@ -33,6 +33,33 @@ def continuous_paths(segments):
     return [np.asarray(path) for path in paths]
 
 
+def visible_path(paths, limits):
+    """Whether a finite line segment intersects the visible plotting rectangle."""
+    if isinstance(paths, np.ndarray) and paths.ndim == 3:
+        start = paths[:, :-1].reshape(-1, 2)
+        delta = np.diff(paths, axis=1).reshape(-1, 2)
+    else:
+        paths = [np.asarray(path, dtype=float) for path in paths if len(path) >= 2]
+        if not paths:
+            return False
+        start = np.concatenate([path[:-1] for path in paths])
+        delta = np.concatenate([np.diff(path, axis=0) for path in paths])
+    valid = np.isfinite(start).all(axis=1) & np.isfinite(delta).all(axis=1)
+    valid &= np.any(delta != 0, axis=1)
+    enter, leave = np.zeros(len(start)), np.ones(len(start))
+    for axis, (low, high) in enumerate(limits):
+        low, high = sorted((low, high))
+        moving = delta[:, axis] != 0
+        valid &= moving | ((start[:, axis] >= low) & (start[:, axis] <= high))
+        a = np.divide(low-start[:, axis], delta[:, axis],
+                      out=np.full(len(start), -np.inf), where=moving)
+        b = np.divide(high-start[:, axis], delta[:, axis],
+                      out=np.full(len(start), np.inf), where=moving)
+        enter = np.maximum(enter, np.minimum(a, b))
+        leave = np.minimum(leave, np.maximum(a, b))
+    return bool(np.any(valid & (enter <= leave)))
+
+
 class LegendSample(QWidget):
     def __init__(self, style):
         super().__init__()
@@ -90,12 +117,12 @@ class BifurcationLegend(QWidget):
         for column in range(3):
             layout.setColumnStretch(column, 1)
 
-    def set_trace_entries(self, outward=False, returning=False, jump=False):
-        trace = {"outward": outward, "return": returning, "jump": jump}
-        visible = tuple(key for key in self.entry_widgets if trace.get(key, True))
+    def set_entries(self, keys):
+        visible = tuple(key for key in self.entry_widgets if key in keys)
         if visible == self._visible_keys:
             return
         self._visible_keys = visible
+        self.setVisible(bool(visible))
         for key, widget in self.entry_widgets.items():
             self.grid.removeWidget(widget)
             widget.setVisible(key in visible)
@@ -219,6 +246,11 @@ class BifurcationPanel(QWidget):
         layout.addWidget(self.canvas, 1)
         self.legend = BifurcationLegend()
         self._update_key()
+        self.information_panel = QWidget()
+        information_layout = QVBoxLayout(self.information_panel)
+        information_layout.setContentsMargins(0, 0, 0, 0)
+        information_layout.setSpacing(4)
+        information_layout.addWidget(self.legend)
         class ScrollInformation(info_class):
             def _fit_height(self, size):
                 self.setFixedHeight(max(24, math.ceil(size.height())+6))
@@ -227,19 +259,20 @@ class BifurcationPanel(QWidget):
         self.info_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setFixedHeight(94+saved_row_height)
+        scroll.setMinimumHeight(0)
+        self.information_panel.setFixedHeight(94+saved_row_height)
         self.status = QLabel("Equations and ranges update automatically.")
         self.status.setWordWrap(True)
         information = QWidget()
         info_layout = QVBoxLayout(information)
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(4)
-        info_layout.addWidget(self.legend)
         info_layout.addWidget(self.info)
         info_layout.addWidget(self.status)
         info_layout.addStretch(1)
         scroll.setWidget(information)
-        layout.addWidget(scroll)
+        information_layout.addWidget(scroll, 1)
+        layout.addWidget(self.information_panel)
         self.preset.currentTextChanged.connect(self._preset)
         self.formula.textChanged.connect(self._formula_changed)
         for spin in (self.mu0, self.x0):
@@ -358,6 +391,7 @@ class BifurcationPanel(QWidget):
 
     def _view_changed(self, _axes):
         if not self._drawing:
+            self._sync_legend()
             self.view_debounce.start()
 
     def _analyze_view(self):
@@ -460,16 +494,32 @@ class BifurcationPanel(QWidget):
         blue = "#80cfff" if self.dark else "#2453a5"
         red = "#ff7272" if self.dark else "#ca4040"
         self.legend.set_colors(blue, red)
-        self._sync_trace_legend()
+        self._sync_legend()
 
-    def _sync_trace_legend(self):
+    def _sync_legend(self):
+        limits = (self.ax.get_xlim(), self.ax.get_ylim())
+        keys = set()
+        if self.result:
+            kinds = np.asarray(self.result["stability"])
+            segments = np.asarray(self.result["segments"])
+            for code, key in ((-1, "stable"), (1, "unstable"),
+                              (0, "inconclusive"), (2, "semistable")):
+                if visible_path(segments[kinds == code], limits):
+                    keys.add(key)
+            if self.show_derivative.isChecked() and visible_path(self.result["derivative"], limits):
+                keys.add("derivative")
+            if any(limits[0][0] <= p["mu"] <= limits[0][1]
+                   and limits[1][0] <= p["x"] <= limits[1][1] for p in self.result["critical"]):
+                keys.add("critical")
         result = self.trace_result or {}
-        drawn_legs = {leg for leg, path in zip(result.get("segment_legs", []),
-                      result.get("segments", [])) if len(path) >= 2}
-        self.legend.set_trace_entries(
-            outward=0 in drawn_legs,
-            returning=self.roundtrip.isChecked() and 1 in drawn_legs,
-            jump=bool(result.get("jumps", [])))
+        for leg, path in zip(result.get("segment_legs", []), result.get("segments", [])):
+            if visible_path([path], limits):
+                keys.add("outward" if leg == 0 else "return")
+        if not self.roundtrip.isChecked():
+            keys.discard("return")
+        if visible_path(result.get("jumps", []), limits):
+            keys.add("jump")
+        self.legend.set_entries(keys)
 
     def set_dark(self, dark):
         self.dark = bool(dark)
@@ -478,14 +528,13 @@ class BifurcationPanel(QWidget):
         saved_row_height = max(self.mu0.sizeHint().height(), self.x0.sizeHint().height(),
                                self.trace_btn.sizeHint().height())+max(0, self._sweep_grid.verticalSpacing())
         removed_equation_row = max(self.preset.sizeHint().height(), self.trace_btn.sizeHint().height())+max(0, self._scalar_grid.verticalSpacing())
-        self.info_scroll.setFixedHeight(94+saved_row_height+removed_equation_row)
+        self.information_panel.setFixedHeight(94+saved_row_height+removed_equation_row)
         self._update_key()
         self.info_scroll.setStyleSheet(self.host.equilibrium_scroll.styleSheet())
         self._info()
         self.draw()
 
     def draw(self, reset=False):
-        self._sync_trace_legend()
         self._drawing = True
         limits = (self.ax.get_xlim(), self.ax.get_ylim())
         self.ax.clear()
@@ -537,6 +586,7 @@ class BifurcationPanel(QWidget):
         # each redraw. Ignore programmatic redraws; observe actual view edits.
         self.ax.callbacks.connect("xlim_changed", self._view_changed)
         self.ax.callbacks.connect("ylim_changed", self._view_changed)
+        self._sync_legend()
         self._drawing = False
         self.canvas.draw_idle()
 
