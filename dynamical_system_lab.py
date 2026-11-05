@@ -32,7 +32,7 @@ from PySide6.QtGui import (
     QFont, QFontDatabase, QImage, QPixmap, QPainter, QSurfaceFormat, QVector4D,
     QColor, QRawFont, QGlyphRun, QPyTextObject, QTextFormat,
     QTextCharFormat, QTextCursor, QTextBlockFormat,
-    QSyntaxHighlighter, QPainterPath,
+    QSyntaxHighlighter, QPainterPath, QFontMetricsF, QLinearGradient, QBrush,
 )
 from PySide6.QtOpenGL import (
     QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat,
@@ -3368,8 +3368,21 @@ class SpeedColorButton(QToolButton):
     def __init__(self):
         super().__init__()
         self.setCheckable(True)
-        self.setFixedSize(32, 26)
-        self.setAccessibleName("Speed colors")
+        self.setText("speed color")
+        self.caption_font = QFont(self.font())
+        self.caption_font.setPointSizeF(max(7, self.caption_font.pointSizeF()-1))
+        metrics = QFontMetricsF(self.caption_font)
+        text_width = metrics.horizontalAdvance(self.text())
+        self.setFixedSize(36+math.ceil(text_width)+2, 26)
+        self.setAccessibleName("Speed color")
+        self.caption_path = QPainterPath()
+        self.caption_path.addText(36, (26-metrics.height())/2+metrics.ascent(),
+                                  self.caption_font, self.text())
+        gradient = QLinearGradient(36, 0, 36+text_width, 0)
+        colormap = speed_colormap()
+        for stop in np.linspace(0, 1, 17):
+            gradient.setColorAt(float(stop), QColor.fromRgbF(*colormap(float(stop))[:3]))
+        self.caption_gradient = QBrush(gradient)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet("QToolButton {border: none; background: transparent; padding: 0;}")
         self.dark = False
@@ -3398,6 +3411,9 @@ class SpeedColorButton(QToolButton):
                     color = QColor(gray, gray, gray)
                 painter.setBrush(color)
                 painter.drawPie(rect, angle*16, 15*16+8)
+        painter.setClipping(False)
+        painter.fillPath(self.caption_path, self.caption_gradient if self.isChecked() else
+                         QBrush(QColor("#a0a0a0" if self.dark else "#777777")))
 
 
 class DynamicalSystemLab(QMainWindow):
