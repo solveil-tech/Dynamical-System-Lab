@@ -55,6 +55,7 @@ class LegendSample(QWidget):
 class BifurcationLegend(QWidget):
     def __init__(self):
         super().__init__()
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout = QGridLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setHorizontalSpacing(10)
@@ -236,6 +237,7 @@ class BifurcationPanel(QWidget):
         info_layout.addWidget(self.legend)
         info_layout.addWidget(self.info)
         info_layout.addWidget(self.status)
+        info_layout.addStretch(1)
         scroll.setWidget(information)
         layout.addWidget(scroll)
         self.preset.currentTextChanged.connect(self._preset)

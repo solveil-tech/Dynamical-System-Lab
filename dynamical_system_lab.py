@@ -98,7 +98,7 @@ FUNCTIONS = {
     "sign": np.sign, "minimum": np.minimum, "maximum": np.maximum,
 }
 
-PHASE_TOP_MARGIN = 32
+PHASE_TOP_MARGIN = 26
 PHASE_BOTTOM_MARGIN = 34
 
 LATEX_SYMBOLS = {
@@ -3660,14 +3660,14 @@ class DynamicalSystemLab(QMainWindow):
 
         self.respawn_period = self.make_spin(5.0, 1.0, 60.0, 1.0)
         self.respawn_period.setSuffix(" s")
-        self._add_2d_setting(form, "Respawn cycle", 4, 0, 1, 2)
-        form.addWidget(self.respawn_period, 4, 2, 1, 2)
+        self._add_2d_setting(form, "Respawn", 4, 0)
+        form.addWidget(self.respawn_period, 4, 1)
         self._two_d_only_widgets.append(self.respawn_period)
         self.first_quadrant = QCheckBox("1st quadrant")
         self.first_quadrant.setToolTip(
             "Show x ≥ 0 and y ≥ 0, with the origin at the lower left. Zoom remains available.")
         self.first_quadrant.toggled.connect(self._on_first_quadrant_changed)
-        form.addWidget(self.first_quadrant, 5, 0, 1, 4)
+        form.addWidget(self.first_quadrant, 4, 2, 1, 2)
         self._two_d_only_widgets.append(self.first_quadrant)
 
         self.dt = self.make_spin(0.01, 0.001, 0.5, 0.005)
