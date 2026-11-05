@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QFormLayout, QGroupBox, QLabel, QLineEdit,
     QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox,
     QSplitter, QAbstractSpinBox, QComboBox, QStackedWidget, QSizePolicy, QFrame, QScrollArea,
-    QTabWidget, QFileDialog, QTextEdit, QToolButton,
+    QTabWidget, QTabBar, QFileDialog, QTextEdit, QToolButton,
     QProxyStyle, QStyle, QStyleOption, QStyleOptionComboBox,
 )
 
@@ -3441,6 +3441,13 @@ class DynamicalSystemLab(QMainWindow):
         title_layout.addWidget(self.dark_mode_check, 0, Qt.AlignmentFlag.AlignRight)
         controls.addWidget(self.title_header)
 
+        self.flow_controls = QWidget()
+        flow_controls_layout = QVBoxLayout(self.flow_controls)
+        flow_controls_layout.setContentsMargins(0, 0, 0, 0)
+        flow_controls_layout.setSpacing(4)
+        controls.addWidget(self.flow_controls, 1)
+        controls = flow_controls_layout
+
         eq_box = QGroupBox("Differential equations")
         eq_form = QFormLayout(eq_box)
         self.dimension_selector = PopupComboBox()
@@ -3673,7 +3680,9 @@ class DynamicalSystemLab(QMainWindow):
         equilibrium_options.addWidget(self.show_nullclines)
         controls.addLayout(equilibrium_options)
 
-        buttons = QGridLayout()
+        self.flow_actions = QWidget()
+        buttons = QGridLayout(self.flow_actions)
+        buttons.setContentsMargins(0, 0, 0, 0)
         self.start_btn = QPushButton("Start")
         self.start_btn.clicked.connect(self.toggle_animation)
         buttons.addWidget(self.start_btn, 0, 0, 1, 2)
@@ -3695,13 +3704,19 @@ class DynamicalSystemLab(QMainWindow):
         buttons.addWidget(self.center_view_btn, 2, 1)
         self._two_d_only_widgets.append(self.center_view_btn)
         self._action_buttons = buttons
-        controls.addLayout(buttons)
+        controls.addWidget(self.flow_actions)
 
         self.status = QLabel("Ready. Equations update as you edit.")
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color: #666666; padding: 5px 2px;")
         controls.addWidget(self.status)
         controls.addStretch()
+        self.flow_mask = QWidget(self.flow_controls)
+        self.flow_mask.setObjectName("flowControlMask")
+        self.flow_mask.setStyleSheet(
+            "QWidget#flowControlMask { background-color: rgba(128, 128, 128, 95); border: none; }")
+        self.flow_mask.hide()
+        self.flow_controls.installEventFilter(self)
 
         plot_panel = QWidget()
         plot_panel.setMinimumWidth(500)
@@ -3767,17 +3782,23 @@ class DynamicalSystemLab(QMainWindow):
             self, NotationLineEdit, PopupComboBox, EquilibriumInfo, format_formula_input)
         bifurcation_index = self.right_tabs.addTab(self.bifurcation_panel, "Bifurcation")
         self.right_tabs.setTabVisible(bifurcation_index, False)
-        self.bifurcation_btn = QPushButton("Bifurcation")
-        self.bifurcation_btn.setCheckable(True)
-        self.right_tabs.setCornerWidget(self.bifurcation_btn, Qt.Corner.TopRightCorner)
-        def open_bifurcation():
-            self.right_tabs.setCurrentIndex(bifurcation_index)
-            self.bifurcation_btn.setChecked(True)
-        self.bifurcation_btn.clicked.connect(open_bifurcation)
+        self.mode_tabs = QTabBar()
+        self.mode_tabs.setShape(self.right_tabs.tabBar().shape())
+        self.mode_tabs.setDrawBase(False)
+        self.mode_tabs.setExpanding(False)
+        self.mode_tabs.addTab("Flow")
+        self.mode_tabs.addTab("Bifurcation")
+        self.right_tabs.setCornerWidget(self.mode_tabs, Qt.Corner.TopRightCorner)
+        self.mode_tabs.currentChanged.connect(
+            lambda mode: self.right_tabs.setCurrentIndex(bifurcation_index if mode == 1 else 0))
         def select_analysis_tab(index):
-            self.bifurcation_btn.setChecked(index == bifurcation_index)
-            equilibrium_box.setVisible(index != bifurcation_index)
-            if index == bifurcation_index:
+            active = index == bifurcation_index
+            blocker = QSignalBlocker(self.mode_tabs)
+            self.mode_tabs.setCurrentIndex(1 if active else 0)
+            del blocker
+            self._set_bifurcation_mode(active)
+            equilibrium_box.setVisible(not active)
+            if active:
                 self.bifurcation_panel.activate()
         self.right_tabs.currentChanged.connect(select_analysis_tab)
 
@@ -3794,6 +3815,17 @@ class DynamicalSystemLab(QMainWindow):
         # Observe right-side child widgets too. Formula focus/undo is handled
         # here once, instead of registering this filter twice on each editor.
         QApplication.instance().installEventFilter(self)
+
+    def _set_bifurcation_mode(self, active):
+        if active and self.running:
+            self.stop_animation()
+            self.status.setText("Paused.")
+        self.flow_actions.setVisible(not active)
+        self.flow_controls.setEnabled(not active)
+        self.flow_mask.setGeometry(self.flow_controls.rect())
+        self.flow_mask.setVisible(active)
+        if active:
+            self.flow_mask.raise_()
 
     def _build_experience_tabs(self):
         page = QWidget()
@@ -4808,6 +4840,9 @@ class DynamicalSystemLab(QMainWindow):
             [normalize_display_expression(text) for text in expressions], names, reserved)
 
     def eventFilter(self, watched, event):
+        if (watched is getattr(self, "flow_controls", None)
+                and event.type() == QEvent.Type.Resize):
+            self.flow_mask.setGeometry(watched.rect())
         if (watched is getattr(self, "view_stack", None)
                 and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
             controls = self.phase_zoom_controls
@@ -5483,6 +5518,9 @@ class DynamicalSystemLab(QMainWindow):
             self.clear_trails()
 
     def toggle_animation(self):
+        if hasattr(self, "mode_tabs") and self.mode_tabs.currentIndex() == 1:
+            self.stop_animation()
+            return
         if self.running:
             self.stop_animation()
             self.status.setText("Paused.")
