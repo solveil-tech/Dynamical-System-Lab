@@ -78,21 +78,26 @@ class BifurcationPanel(QWidget):
             spin.setMinimumWidth(60)
             self.bounds.append(spin)
             grid.addWidget(QLabel(label), 2+i//2, 3*(i%2))
-            grid.addWidget(spin, 2+i//2, 3*(i%2)+1, 1, 2)
+            field_slot = QWidget()
+            field_layout = QHBoxLayout(field_slot)
+            field_layout.setContentsMargins(0, 0, 0, 0)
+            field_layout.setSpacing(0)
+            field_layout.addWidget(spin, 3)
+            field_layout.addStretch(1)
+            grid.addWidget(field_slot, 2+i//2, 3*(i%2)+1, 1, 2)
             spin.valueChanged.connect(self._changed)
         self._home_bounds = tuple(spin.value() for spin in self.bounds)
         layout.addWidget(box)
         box = QGroupBox("Parameter sweep (click the diagram to select μ₀, x₀)")
         grid = QGridLayout(box)
         self._sweep_grid = grid
-        self.mode, self.direction = combo_class(), combo_class()
-        self.mode.addItems(["Quasistatic", "Finite-rate"])
+        self.direction = combo_class()
         self.direction.addItems(["Increasing μ", "Decreasing μ"])
         self.roundtrip = QCheckBox("Round trip")
         self.roundtrip.setChecked(False)
         self.mu0 = host.make_spin(-1, -10000, 10000, 0.1)
         self.x0 = host.make_spin(-1.3, -10000, 10000, 0.1)
-        for col, widget in enumerate((self.mode, self.direction, self.roundtrip)):
+        for col, widget in enumerate((QLabel("Quasistatic"), self.direction, self.roundtrip)):
             grid.addWidget(widget, 0, col*2, 1, 2)
         self.trace_btn = QPushButton("Trace sweep")
         self.trace_btn.clicked.connect(self.trace)
@@ -155,7 +160,6 @@ class BifurcationPanel(QWidget):
         self.formula.textChanged.connect(self._formula_changed)
         for spin in (self.mu0, self.x0):
             spin.valueChanged.connect(self.clear_trace)
-        self.mode.currentTextChanged.connect(self._mode_changed)
         self.direction.currentTextChanged.connect(self.clear_trace)
         self.roundtrip.toggled.connect(self.clear_trace)
         self.canvas.mpl_connect("button_press_event", self._mouse_down)
@@ -300,9 +304,6 @@ class BifurcationPanel(QWidget):
             self.info.set_rows(["Analysis incomplete: "+message], self.fg)
             self.analysis_key = None
 
-    def _mode_changed(self, _text):
-        self.clear_trace()
-
     def clear_trace(self, *_args):
         self.tracer.cancel()
         self.trace_key = None
@@ -324,7 +325,7 @@ class BifurcationPanel(QWidget):
             return
         data.update(initial=initial, direction=1 if self.direction.currentIndex() == 0 else -1,
                     roundtrip=self.roundtrip.isChecked(), rate=0.1,
-                    perturbation=0.001, mode="finite" if self.mode.currentIndex() else "quasistatic")
+                    perturbation=0.001, mode="quasistatic")
         self.trace_key = (self.analysis_key, tuple(sorted((k, str(v)) for k, v in data.items())))
         self.trace_result = None
         self.draw()

@@ -61,7 +61,8 @@ closely spaced roots and nonpolynomial tangencies can be missed.
 
 ## Sweeps, jumps and reversibility
 
-**Quasistatic** is a phase-line, adiabatic branch-following approximation, not an
+The page uses **Quasistatic** scanning only; there is no mode selector.
+It is a phase-line, adiabatic branch-following approximation, not an
 integration at a specified nonzero speed. At each sampled μ, it follows the
 scalar flow direction to the reachable equilibrium. Dashed vertical connectors
 represent initial fast relaxation and loss-of-branch jumps. They do not assert
@@ -76,11 +77,6 @@ branches, with tolerance 1% of the x window (minimum 0.0001). Different
 attracting branches are reported as hysteresis **on the selected sweep**.
 Escape, domain boundaries or non-isolated equilibrium slices give undetermined,
 not an irreversible conclusion. This is not a proof of global reversibility.
-
-**Finite-rate** integrates `dx/dt=f(x,μ)`, `dμ/dt=±0.1` with the existing adaptive
-Dormand–Prince solver. Curves remain continuous. A finite-rate return mismatch
-can be a rate-dependent lag and is not used to infer quasistatic hysteresis.
-Integration limits and partial paths are reported explicitly.
 
 Analysis and sweeps run in cancellable processes with 20-second calculation
 budgets. New formulas cancel old jobs; late results cannot overwrite new input.
