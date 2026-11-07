@@ -25,14 +25,13 @@ from equilibrium_algebra import (
     equilibrium_set_text, clean_numerical_point, unresolved_equilibrium_text,
     is_hamiltonian_center,
 )
-from periodic_orbits import find_periodic_orbits
 
 from PySide6.QtCore import Qt, QTimer, Signal, QSize, QSizeF, QPointF, QRect, QRectF, QSignalBlocker, QEvent, QMimeData
 from PySide6.QtGui import (
     QFont, QFontDatabase, QImage, QPixmap, QPainter, QSurfaceFormat, QVector4D,
     QColor, QRawFont, QGlyphRun, QPyTextObject, QTextFormat,
     QTextCharFormat, QTextCursor, QTextBlockFormat,
-    QSyntaxHighlighter, QPainterPath,
+    QSyntaxHighlighter, QPainterPath, QPen,
 )
 from PySide6.QtOpenGL import (
     QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat,
@@ -47,7 +46,7 @@ from PySide6.QtWidgets import (
     QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox,
     QSplitter, QAbstractSpinBox, QComboBox, QStackedWidget, QSizePolicy, QFrame, QScrollArea,
     QTabWidget, QTabBar, QFileDialog, QTextEdit, QToolButton, QGraphicsOpacityEffect, QSpacerItem,
-    QProxyStyle, QStyle, QStyleOption, QStyleOptionComboBox,
+    QProxyStyle, QStyle, QStyleOption, QStyleOptionComboBox, QToolTip,
 )
 
 from matplotlib import rc_context
@@ -100,6 +99,7 @@ FUNCTIONS = {
 
 PHASE_TOP_MARGIN = 26
 PHASE_BOTTOM_MARGIN = 34
+PHASE_TOOLS_INSET = 10
 
 LATEX_SYMBOLS = {
     r"\alpha": "α", r"\beta": "β", r"\gamma": "γ", r"\delta": "δ",
@@ -1050,6 +1050,8 @@ def classify_equilibrium(fields, point, params, exact_jacobian=None):
         "linearization": linearization,
         "eigenvalues": eigen_text,
         "jacobian": jacobian,
+        "eigenvalues_numeric": eigenvalues,
+        "eigenvectors": eigenvectors,
     }
 
 
@@ -3400,6 +3402,36 @@ class SpeedColorButton(QToolButton):
                 painter.drawPie(rect, angle*16, 15*16+8)
 
 
+class InspectEquilibriumButton(QToolButton):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setFixedSize(32, 26)
+        self.setAccessibleName("Inspect equilibria")
+        self.setToolTip("Inspect a reported equilibrium from the current analysis.")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setStyleSheet("QToolButton {border: none; background: transparent; padding: 0;}")
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = self.palette().color(self.foregroundRole())
+        if not self.isEnabled():
+            painter.setOpacity(.45)
+        elif self.underMouse() or self.hasFocus():
+            color = QColor("#3385c6")
+        eye = QPainterPath()
+        eye.moveTo(5, 13)
+        eye.cubicTo(11, 4, 21, 4, 27, 13)
+        eye.cubicTo(21, 22, 11, 22, 5, 13)
+        painter.setPen(QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                            Qt.PenJoinStyle.RoundJoin))
+        painter.drawPath(eye)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(QPointF(16, 13), 2.7, 2.7)
+
+
 class DynamicalSystemLab(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3457,6 +3489,10 @@ class DynamicalSystemLab(QMainWindow):
         self._nullcline_debounce.setInterval(200)
         self._nullcline_debounce.timeout.connect(self._dispatch_nullcline_analysis)
         self._selected_solution = None
+        self._solution_request = None
+        self._solution_process = AnalysisProcess(self, timeout_ms=12000)
+        self._solution_process.completed.connect(self._on_solution_complete)
+        self._solution_process.failed.connect(self._on_solution_failed)
         self._parameter_editors = {}
         self._initial_states = {"2D": (1.0, 0.0, 0.0), "3D": (0.1, 0.0, 0.0)}
         self._loading_experiment = False
@@ -3807,10 +3843,13 @@ class DynamicalSystemLab(QMainWindow):
         action_policy = self.flow_actions.sizePolicy()
         action_policy.setRetainSizeWhenHidden(True)
         self.flow_actions.setSizePolicy(action_policy)
-        self.flow_opacity = QGraphicsOpacityEffect(self.flow_controls)
-        self.flow_opacity.setOpacity(0.5)
-        self.flow_opacity.setEnabled(False)
-        self.flow_controls.setGraphicsEffect(self.flow_opacity)
+        self._flow_sections = (eq_box, self.parameter_box, settings, self.flow_options,
+                               self.flow_actions, self.status)
+        for section in self._flow_sections:
+            opacity = QGraphicsOpacityEffect(section)
+            opacity.setOpacity(0.5)
+            opacity.setEnabled(False)
+            section.setGraphicsEffect(opacity)
 
         plot_panel = QWidget()
         plot_panel.setMinimumWidth(500)
@@ -3849,7 +3888,7 @@ class DynamicalSystemLab(QMainWindow):
         phase_layout.setContentsMargins(0, 0, 0, 0)
         phase_layout.setSpacing(2)
         phase_tools = QHBoxLayout()
-        phase_tools.setContentsMargins(10, 0, 10, 0)
+        phase_tools.setContentsMargins(PHASE_TOOLS_INSET, 0, PHASE_TOOLS_INSET, 0)
         phase_tools.addWidget(self.speed_color)
         phase_tools.addStretch(1)
         phase_tools.addWidget(self.phase_zoom_controls)
@@ -3862,6 +3901,9 @@ class DynamicalSystemLab(QMainWindow):
         self.speed_legend.setFixedHeight(36)
         phase_layout.addWidget(self.speed_legend)
         phase_layout.addStretch(0)
+        self.inspect_equilibrium_btn = InspectEquilibriumButton(phase_page)
+        self.inspect_equilibrium_btn.setEnabled(False)
+        self.inspect_equilibrium_btn.clicked.connect(self._inspect_equilibria)
         self.view_stack.currentChanged.connect(lambda _index: QTimer.singleShot(0, self._update_phase_layout))
         self.right_tabs.addTab(phase_page, "Phase portrait")
         self._build_experience_tabs()
@@ -3947,8 +3989,10 @@ class DynamicalSystemLab(QMainWindow):
             self.status.setText("Paused.")
         self.flow_actions.setVisible(not active)
         self._sync_sidebar_spacing()
-        self.flow_controls.setEnabled(not active)
-        self.flow_opacity.setEnabled(active)
+        for section in self._flow_sections:
+            section.setEnabled(not active)
+            section.graphicsEffect().setEnabled(active)
+        self._update_calculator_coordinates()
         self.flow_page_tabs.setVisible(not active)
 
     def _configure_sidebar_spacing(self, layout):
@@ -4066,6 +4110,12 @@ class DynamicalSystemLab(QMainWindow):
                 self.duration.value(), self.dt.value())
 
     def _invalidate_selected_solution(self, *_args):
+        if self._solution_request is not None:
+            self._solution_request = None
+            self._solution_process.cancel()
+            self.solution_status.setText("Settings changed. Trace solution to recalculate.")
+            if self.status.text() == "Calculating selected trajectory…":
+                self.status.setText("Selected trajectory canceled.")
         if self._selected_solution is not None:
             self._selected_solution = None
             self.solution_status.setText("Settings changed. Trace solution to recalculate.")
@@ -4089,6 +4139,8 @@ class DynamicalSystemLab(QMainWindow):
         self._invalidate_selected_solution()
 
     def _pick_initial_point(self, x, y):
+        if self._inspect_clicked_orbit(x, y):
+            return
         self.stop_animation(clear_dynamic=True)
         blocker = QSignalBlocker(self.show_selected)
         self.show_selected.setChecked(True)
@@ -4100,6 +4152,34 @@ class DynamicalSystemLab(QMainWindow):
         self._initial_states["2D"] = tuple(spin.value() for spin in self.initial_spins)
         self.trace_solution(focus_short_trace=True)
 
+    def _inspect_clicked_orbit(self, x, y):
+        if (not self.show_equilibria.isChecked() or not self._periodic_orbits
+                or self._auto_apply_timer.isActive() or not self._last_apply_valid
+                or self._periodic_key != self._periodic_model_key()):
+            return False
+        canvas = self.flow_canvas
+        xmin, xmax, ymin, ymax = canvas.bounds
+        left, right, bottom, top = canvas.plot_rect
+        scale = np.array([canvas.width()*(right-left)/(xmax-xmin),
+                          canvas.height()*(top-bottom)/(ymax-ymin)])
+        selected, nearest = None, 6.0**2
+        for orbit in self._periodic_orbits:
+            offsets = (orbit["points"] - [x, y]) * scale
+            segments = np.diff(offsets, axis=0)
+            lengths = np.einsum("ij,ij->i", segments, segments)
+            along = np.clip(-np.einsum("ij,ij->i", offsets[:-1], segments)
+                            / np.maximum(lengths, np.finfo(float).tiny), 0, 1)
+            distance = np.min(np.sum((offsets[:-1] + along[:, None]*segments)**2, axis=1))
+            if distance < nearest:
+                selected, nearest = orbit, distance
+        if selected is None:
+            return False
+        from periodic_inspector import PeriodicOrbitInspector
+        dialog = PeriodicOrbitInspector(self, (self.fx, self.fy), dict(self.params),
+                                       self._periodic_key[3], selected, self.dark_mode_check.isChecked())
+        dialog.open()
+        return True
+
     def _trace_from_controls(self, *_args):
         self.stop_animation()
         blocker = QSignalBlocker(self.show_selected)
@@ -4108,18 +4188,22 @@ class DynamicalSystemLab(QMainWindow):
         self.trace_solution()
 
     def _dismiss_selected_trace(self):
-        if self._selected_solution is None or not self.show_selected.isChecked():
+        if (self._selected_solution is None and self._solution_request is None
+                or not self.show_selected.isChecked()):
             return
         # Hide the phase overlay without discarding its time-series/CSV data.
         blocker = QSignalBlocker(self.show_selected)
         self.show_selected.setChecked(False)
         del blocker
-        self._static_refresh_timer.stop()
-        self._refresh_static_background()
+        if self._selected_solution is not None:
+            self._static_refresh_timer.stop()
+            self._refresh_static_background()
 
     def _after_model_applied(self):
         self._last_apply_valid = True
-        if self._selected_solution is not None and self._selected_solution["signature"] != self._solution_signature():
+        signature = self._solution_signature()
+        if (self._selected_solution is not None and self._selected_solution["signature"] != signature
+                or self._solution_request is not None and self._solution_request[0] != signature):
             self._invalidate_selected_solution()
         self._sync_parameter_fields()
 
@@ -4169,31 +4253,37 @@ class DynamicalSystemLab(QMainWindow):
                 self._pending_3d_key = None
                 self._resume_3d_after_analysis = False
             initial = [spin.value() for spin in self.initial_spins[:len(fields)]]
-            plot_scale = None
             if self._dimension == "2D":
-                xmin, xmax, ymin, ymax = self.flow_canvas.bounds
+                bounds = self.flow_canvas.bounds
+                xmin, xmax, ymin, ymax = bounds
                 left, right, bottom, top = self.flow_canvas.plot_rect
                 ratio = self.flow_canvas.devicePixelRatioF()
                 plot_scale = (
                     self.flow_canvas.width()*ratio*(right-left)/(xmax-xmin),
                     self.flow_canvas.height()*ratio*(top-bottom)/(ymax-ymin),
                 )
+                self._invalidate_selected_solution()
+                key = (self._solution_signature(), bounds, plot_scale, focus_short_trace)
+                self._solution_request = key
+                self.solution_status.setText("Calculating selected trajectory…")
+                self.status.setText("Calculating selected trajectory…")
+                self._solution_process.submit(key, {
+                    "fields": fields, "params": dict(self.params), "initial": initial,
+                    "duration": self.duration.value(), "dt": self.dt.value(), "plot_scale": plot_scale,
+                }, "selected_trajectory")
+                return
             times, points, reason = integrate_trajectory(
                 lambda point: _field_vector(fields, point, self.params), initial,
                 self.duration.value(), self.dt.value(),
-                retain_steps=self._dimension == "2D", spatial_scale=plot_scale,
             )
             self._selected_solution = {
                 "times": times, "points": points, "reason": reason,
                 "velocities": np.asarray([_field_vector(fields, point, self.params) for point in points]),
                 "signature": self._solution_signature(),
             }
-            focused = focus_short_trace and self._focus_short_trace(points, plot_scale)
-            self._selected_solution["experiment"] = self.experiment_data()
-            self.solution_status.setText(f"{reason}; t = {times[0]:g} to {times[-1]:g}; {len(times)} samples\nOriginal equation time; adaptive integration with relative tolerance 10⁻⁷.")
-            self._draw_time_series()
-            if self._dimension == "3D" and self.show_selected.isChecked():
-                speeds = np.array([np.linalg.norm(_field_vector(fields, p, self.params)) for p in points])
+            self._show_solution_result()
+            if self.show_selected.isChecked():
+                speeds = np.linalg.norm(self._selected_solution["velocities"], axis=1)
                 self.canvas3d.set_model(fields, self.params, initial, self.dt.value(),
                     self.dark_mode_check.isChecked(), self.speed_color.isChecked(), self.speed.value(),
                     self.color_max.value() if self.fixed_colors.isChecked() else None,
@@ -4202,14 +4292,49 @@ class DynamicalSystemLab(QMainWindow):
                 self._model_applied = True
                 self.status.setText("Selected 3D trajectory ready.")
                 self._update_speed_legend()
-            else:
-                self._static_refresh_timer.start(20)
-            if focused:
-                self.status.setText("Local view focused. Increase End time to follow the trajectory further.")
         except Exception as exc:
             self._invalidate_selected_solution()
-            self.solution_status.setText(f"Solution unavailable: {exc}")
-            self.status.setText(f"Solution unavailable: {exc}")
+            self._show_solution_error(exc)
+
+    def _on_solution_complete(self, key, result):
+        if key != self._solution_request:
+            return
+        signature, bounds, plot_scale, focus_short_trace = key
+        if not self._last_apply_valid or signature != self._solution_signature():
+            self._invalidate_selected_solution()
+            return
+        self._solution_request = None
+        self._selected_solution = {**result, "signature": signature}
+        try:
+            focused = (focus_short_trace and self.show_selected.isChecked()
+                       and self.right_tabs.currentIndex() == 0 and self.flow_canvas.bounds == bounds
+                       and self._focus_short_trace(result["points"], plot_scale))
+            self._show_solution_result()
+            self._static_refresh_timer.start(20)
+            if focused:
+                self.status.setText("Local view focused. Increase End time to follow the trajectory further.")
+            else:
+                reason = result["reason"]
+                self.status.setText(reason if reason != "Complete" else "Selected trajectory ready.")
+        except Exception as exc:
+            self._invalidate_selected_solution()
+            self._show_solution_error(exc)
+
+    def _on_solution_failed(self, key, message):
+        if key == self._solution_request:
+            self._solution_request = None
+            self._show_solution_error(message)
+
+    def _show_solution_result(self):
+        solution = self._selected_solution
+        solution["experiment"] = self.experiment_data()
+        times = solution["times"]
+        self.solution_status.setText(f"{solution['reason']}; t = {times[0]:g} to {times[-1]:g}; {len(times)} samples\nOriginal equation time; adaptive integration with relative tolerance 10⁻⁷.")
+        self._draw_time_series()
+
+    def _show_solution_error(self, message):
+        self.solution_status.setText(f"Solution unavailable: {message}")
+        self.status.setText(f"Solution unavailable: {message}")
 
     def _on_selected_visibility_changed(self, *_args):
         if self._dimension == "2D":
@@ -4386,6 +4511,9 @@ class DynamicalSystemLab(QMainWindow):
             else:
                 height = max(self.canvas3d.minimumSizeHint().height(), available)
             self.view_stack.setMaximumHeight(max(1, height))
+            button = self.inspect_equilibrium_btn
+            button.move(self.phase_page.width() - PHASE_TOOLS_INSET - button.width(),
+                        self.phase_page.height() - button.height() - 5)
         finally:
             self._phase_layout_updating = False
 
@@ -4837,13 +4965,21 @@ class DynamicalSystemLab(QMainWindow):
         self._fy_label.setText("dθ/dt =" if polar else "dy/dt =")
         self.fx_input.setPlaceholderText("e.g. r*(1-r^2)" if polar else "e.g. x^2 - y")
         self.fy_input.setPlaceholderText("e.g. 1 (radians/time)" if polar else "e.g. x + y^2")
-        for key, value in (("x", "r" if polar else "x"), ("y", "θ" if polar else "y")):
-            self._coordinate_keys[key].setText(value)
-            self._coordinate_keys[key].setProperty("insertValue", value)
-        self._coordinate_keys["z"].setEnabled(not polar)
+        self._update_calculator_coordinates()
         self.to_cartesian_btn.setVisible(polar)
         for widget in (self._coordinate_label, self._coordinate_row):
             widget.setVisible(self._dimension == "2D")
+
+    def _update_calculator_coordinates(self):
+        x, y, enable_z = "x", "y", True
+        if self.right_tabs.currentWidget() is self.bifurcation_panel:
+            y, enable_z = "μ", False
+        elif self._editor_state_key() == "Polar":
+            x, y, enable_z = "r", "θ", False
+        for key, value in (("x", x), ("y", y)):
+            self._coordinate_keys[key].setText(value)
+            self._coordinate_keys[key].setProperty("insertValue", value)
+        self._coordinate_keys["z"].setEnabled(enable_z)
 
     def _convert_polar_to_cartesian(self):
         if self._editor_state_key() != "Polar":
@@ -4887,7 +5023,6 @@ class DynamicalSystemLab(QMainWindow):
             self._updating_model_inputs = False
         self._update_coordinate_controls()
         self._active_formula_editor = self.fx_input
-        self._equilibrium_cache_key = None
         self._auto_apply_timer.start()
 
     def _refresh_model_items(self, dimension, selected):
@@ -5033,9 +5168,11 @@ class DynamicalSystemLab(QMainWindow):
                 and event.button() == Qt.MouseButton.LeftButton
                 and self._dimension == "2D"
                 and self.right_tabs.currentIndex() == 0
-                and self._selected_solution is not None
+                and (self._selected_solution is not None or self._solution_request is not None)
                 and self.show_selected.isChecked()
                 and isinstance(watched, QWidget)
+                and watched is not self.inspect_equilibrium_btn
+                and watched.window() is self
                 and (watched is self or self.isAncestorOf(watched))):
             global_point = event.globalPosition().toPoint()
             on_controls = self.control_panel.rect().contains(self.control_panel.mapFromGlobal(global_point))
@@ -5136,6 +5273,12 @@ class DynamicalSystemLab(QMainWindow):
         QTimer.singleShot(0, settle)
 
     def insert_symbol(self, value):
+        if self.right_tabs.currentWidget() is self.bifurcation_panel:
+            editor = self.bifurcation_panel.formula
+            editor.insert(value)
+            editor.setFocus()
+            return
+
         focused = QApplication.focusWidget()
         if focused in (self.fx_input, self.fy_input, self.fz_input):
             self._active_calculator_editor = focused
@@ -5255,6 +5398,8 @@ class DynamicalSystemLab(QMainWindow):
                 self.status.setText("Preparing OpenGL flow…")
         except Exception as exc:
             self.stop_animation()
+            if self._solution_request is not None:
+                self._invalidate_selected_solution()
             self._equilibrium_debounce.stop()
             self._equilibrium_process.cancel()
             self._equilibrium_pending_request = None
@@ -5338,6 +5483,25 @@ class DynamicalSystemLab(QMainWindow):
             self._equilibrium_pending_request = None
             self._equilibrium_process.submit(key, payload)
 
+    def _inspect_equilibria(self):
+        fields = (self.fx, self.fy) if self._dimension == "2D" else (self.fx, self.fy, getattr(self, "fz", None))
+        model = (self._dimension, tuple(ast.dump(field) for field in fields if field is not None),
+                 tuple(sorted(self.params.items())))
+        if (self._auto_apply_timer.isActive() or not self._equilibrium_cache_key
+                or model != self._equilibrium_cache_key[:3] or not self._equilibrium_results):
+            button = self.inspect_equilibrium_btn
+            QToolTip.showText(button.mapToGlobal(button.rect().bottomLeft()),
+                              "Wait for the current equilibrium analysis.", button)
+            return
+        from equilibrium_inspector import EquilibriumInspector
+        local_radius = 1.0
+        if self._dimension == "2D":
+            xmin, xmax, ymin, ymax = self._active_bounds
+            local_radius = 0.12 * min(xmax - xmin, ymax - ymin)
+        dialog = EquilibriumInspector(self, self._equilibrium_results, fields, dict(self.params),
+                                      local_radius, self.dark_mode_check.isChecked())
+        dialog.open()
+
     def _on_equilibrium_complete(self, key, result):
         if key != self._equilibrium_request_key:
             return
@@ -5346,6 +5510,7 @@ class DynamicalSystemLab(QMainWindow):
         self._equilibrium_sets = result["sets"]
         self._equilibrium_analysis = result["analysis"]
         self._orbit_anchors = result["anchors"]
+        self.inspect_equilibrium_btn.setEnabled(bool(self._equilibrium_results))
         self._render_equilibrium_rows(result["rows"])
         if self._dimension == "3D":
             self.canvas3d.set_equilibrium_points(
@@ -5369,6 +5534,7 @@ class DynamicalSystemLab(QMainWindow):
         self.equilibrium_info.set_rows(displayed, foreground)
 
     def _set_equilibrium_message(self, message):
+        self.inspect_equilibrium_btn.setEnabled(False)
         self._equilibrium_rows = []
         self._equilibrium_base_rows = [message]
         self._equilibrium_message = message
@@ -5409,6 +5575,8 @@ class DynamicalSystemLab(QMainWindow):
         if not self.show_equilibria.isChecked() or key != self._periodic_model_key():
             return
         self._periodic_orbits, self._periodic_rows = result
+        if self._periodic_orbits:
+            self._periodic_rows.append("Click a magenta orbit in the phase portrait to inspect it.")
         self._render_equilibrium_rows(self._equilibrium_base_rows)
         self._static_refresh_timer.start(20)
 
@@ -5457,6 +5625,7 @@ class DynamicalSystemLab(QMainWindow):
 
     def closeEvent(self, event):
         self.bifurcation_panel.close_workers()
+        self._solution_process.close()
         self._phase_resize_timer.stop()
         self._auto_apply_timer.stop()
         self._static_refresh_timer.stop()

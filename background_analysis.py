@@ -197,10 +197,9 @@ def compute_equilibria(data):
     return dict(results=results, sets=sets, analysis=analysis, anchors=anchors, rows=rows)
 
 
-def compute_periodic(data):
+def _periodic_field(fields, params):
     import numpy as np
     import dynamical_system_lab as core
-    fields, params = data["fields"], data["params"]
     def field(points):
         return np.column_stack([np.broadcast_to(
             core.evaluate(component, points[:, 0], points[:, 1], params), len(points))
@@ -218,10 +217,30 @@ def compute_periodic(data):
                     valid &= (a > 0) & (b > 0)
         return valid
     field.valid_step = valid_step
+    return field
+
+
+def compute_periodic(data):
+    from periodic_orbits import find_periodic_orbits
+
+    field = _periodic_field(data["fields"], data["params"])
     if data["analysis"] is not None:
         field.symbolic_fields = data["analysis"]["expressions"]
         field.symbolic_guards = data["analysis"]["guards"]
-    return core.find_periodic_orbits(field, data["bounds"], data["anchors"])
+    return find_periodic_orbits(field, data["bounds"], data["anchors"])
+
+
+def compute_periodic_inspection(data):
+    import numpy as np
+    from dynamical_system_lab import _field_jacobian
+    from periodic_orbits import inspect_periodic_orbit
+
+    fields, params = data["fields"], data["params"]
+    def divergence(points):
+        matrices = (_field_jacobian(fields, point, params) for point in points)
+        return np.array([np.trace(matrix) if matrix is not None else np.nan for matrix in matrices])
+
+    return inspect_periodic_orbit(_periodic_field(fields, params), divergence, data["bounds"], data["orbit"])
 
 
 def compute_nullclines(data):
@@ -260,6 +279,74 @@ def compute_trajectory3d(data):
         data["fields"], data["params"], data["initial"], data["dt"])
 
 
+def compute_selected_trajectory(data):
+    import numpy as np
+    import dynamical_system_lab as core
+    from flow_tools import integrate_trajectory
+
+    def field(point):
+        return core._field_vector(data["fields"], point, data["params"])
+
+    times, points, reason = integrate_trajectory(
+        field, data["initial"], data["duration"], data["dt"],
+        retain_steps=True, spatial_scale=data["plot_scale"],
+    )
+    return {
+        "times": times, "points": points, "reason": reason,
+        "velocities": np.asarray([field(point) for point in points]),
+    }
+
+
+def compute_saddle_manifolds(data):
+    import math
+    import numpy as np
+    import dynamical_system_lab as core
+    from flow_tools import integrate_trajectory
+
+    fields, params = data["fields"], data["params"]
+    point, radius = data["point"], data["radius"]
+    guards = core._equilibrium_domain_guards(fields, params)
+    signs = [np.sign(core.evaluate(guard, *point, params)) for guard, _ in guards]
+    seed = max(1e-4, 8 * np.finfo(float).eps * np.max(np.abs(point)) / radius)
+    paths, incomplete = [], 0
+    for direction, stable in data["directions"]:
+        def field(offset):
+            if np.max(np.abs(offset)) > 1.03:
+                raise ValueError("Reached the local window boundary")
+            state = point + radius * offset
+            for (guard, positive), sign in zip(guards, signs):
+                value = core.evaluate(guard, *state, params)
+                if not np.isfinite(value) or not sign or np.sign(value) != sign or (positive and value < 0):
+                    raise ValueError("Reached an excluded part of the field domain")
+            velocity = core._field_vector(fields, state, params)
+            speed = math.hypot(*velocity)
+            if not math.isfinite(speed) or speed == 0:
+                raise ValueError("The direction of the flow is unavailable")
+            # Unit speed preserves geometric paths. Reverse the field to
+            # trace the stable branches away from the saddle.
+            return (-1 if stable else 1) * (velocity / speed)
+
+        for side in (-1, 1):
+            try:
+                _, offsets, reason = integrate_trajectory(
+                    field, side * seed * direction, 3.0,
+                    max_step=0.0125, samples=241, retain_steps=True, time_limit=1.0)
+            except ValueError:
+                incomplete += 1
+                continue
+            if reason != "Complete" and np.max(np.abs(offsets[-1])) < 1:
+                incomplete += 1
+            if len(offsets) > 1:
+                paths.append((stable, point + radius * offsets))
+    axis = radius * np.linspace(-.92, .92, 13)
+    x, y = np.meshgrid(point[0] + axis, point[1] + axis)
+    u, v = (np.broadcast_to(core.evaluate(component, x, y, params), x.shape) for component in fields)
+    speed = np.hypot(u, v)
+    valid = np.isfinite(speed) & (speed > 0)
+    arrows = (x[valid], y[valid], u[valid] / speed[valid], v[valid] / speed[valid])
+    return paths, incomplete, arrows
+
+
 def _serve():
     import dynamical_system_lab  # Warm imports once, without constructing a window.
     from bifurcation import analyze as analyze_bifurcation, trace as trace_bifurcation
@@ -271,8 +358,11 @@ def _serve():
         request = pickle.loads(base64.b64decode(line[4:]))
         try:
             handler = {"equilibrium": compute_equilibria, "periodic": compute_periodic,
+                       "periodic_inspection": compute_periodic_inspection,
                        "nullclines": compute_nullclines,
                        "trajectory3d": compute_trajectory3d,
+                       "selected_trajectory": compute_selected_trajectory,
+                       "saddle_manifolds": compute_saddle_manifolds,
                        "bifurcation": analyze_bifurcation,
                        "bifurcation_trace": trace_bifurcation}[request["kind"]]
             result = handler(request["payload"])

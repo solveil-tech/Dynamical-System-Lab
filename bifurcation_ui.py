@@ -5,7 +5,8 @@ import numpy as np
 from PySide6.QtCore import QTimer, QSignalBlocker, Qt, QPointF
 from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QGridLayout, QHBoxLayout,
-    QGroupBox, QLabel, QPushButton, QCheckBox, QScrollArea, QFrame, QFileDialog, QSizePolicy)
+    QGroupBox, QLabel, QPushButton, QCheckBox, QScrollArea, QFrame, QFileDialog, QSizePolicy, QApplication)
+from matplotlib.backend_bases import MouseButton
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.collections import LineCollection
@@ -146,6 +147,7 @@ class BifurcationPanel(QWidget):
         self.result = self.trace_result = self.analysis_key = self.trace_key = None
         self.dark, self.initialized = False, False
         self._press = None
+        self._dragging = False
         self._drawing = False
         self.view_debounce = QTimer(self)
         self.view_debounce.setSingleShot(True)
@@ -283,6 +285,7 @@ class BifurcationPanel(QWidget):
         self.direction.currentTextChanged.connect(self.clear_trace)
         self.roundtrip.toggled.connect(self.clear_trace)
         self.canvas.mpl_connect("button_press_event", self._mouse_down)
+        self.canvas.mpl_connect("motion_notify_event", self._mouse_move)
         self.canvas.mpl_connect("button_release_event", self._mouse_up)
         self.canvas.mpl_connect("scroll_event", lambda event: self.zoom(.8 if event.button == "up" else 1.25))
         self.draw(reset=True)
@@ -294,6 +297,7 @@ class BifurcationPanel(QWidget):
             self.analyze()
 
     def deactivate(self):
+        self._end_pan()
         self.canvas.setMinimumHeight(0)
 
     def _preset(self, name):
@@ -383,7 +387,7 @@ class BifurcationPanel(QWidget):
         if key != self.analysis_key:
             return
         self.result = result
-        self.status.setText("Ready. Click inside the diagram to trace a parameter sweep.")
+        self.status.setText("Ready. Drag to pan or click inside the diagram to trace a parameter sweep.")
         self._info()
         self.draw()
 
@@ -601,13 +605,47 @@ class BifurcationPanel(QWidget):
         self.canvas.draw_idle()
 
     def _mouse_down(self, event):
-        self._press = (event.x, event.y) if event.inaxes is self.ax and event.button == 1 else None
+        if event.inaxes is not self.ax or event.button != MouseButton.LEFT:
+            return
+        self._press = (event.x, event.y, self.ax.get_xlim(), self.ax.get_ylim(),
+                       self.ax.bbox.width, self.ax.bbox.height)
+        self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _mouse_move(self, event):
+        if self._press is None:
+            return
+        start_x, start_y, xlim, ylim, width, height = self._press
+        dx, dy = event.x-start_x, event.y-start_y
+        if not self._dragging:
+            threshold = QApplication.startDragDistance()*self.canvas.device_pixel_ratio
+            if math.hypot(dx, dy) < threshold:
+                return
+            self._dragging = True
+            self.view_debounce.stop()
+        for delta, size, limits, set_limits, bounds in (
+                (dx, width, xlim, self.ax.set_xlim, self.bounds[:2]),
+                (dy, height, ylim, self.ax.set_ylim, self.bounds[2:])):
+            low, high = limits
+            min_shift = bounds[0].minimum()-low
+            max_shift = bounds[1].maximum()-high
+            if min_shift <= max_shift:
+                shift = max(min_shift, min(max_shift, -delta*(high-low)/max(1, size)))
+                set_limits(low+shift, high+shift, emit=False)
+        self.canvas.draw_idle()
+
+    def _end_pan(self):
+        self._press = None
+        self.canvas.unsetCursor()
+        dragged, self._dragging = self._dragging, False
+        if dragged:
+            self._view_changed(self.ax)
+        return dragged
 
     def _mouse_up(self, event):
-        pressed, self._press = self._press, None
-        if pressed is None or event.inaxes is not self.ax or event.button != 1:
+        if self._press is None or event.button != MouseButton.LEFT:
             return
-        if np.hypot(event.x-pressed[0], event.y-pressed[1]) > 5:
+        self._mouse_move(event)
+        if self._end_pan() or event.inaxes is not self.ax:
             return
         for spin, value in ((self.mu0, event.xdata), (self.x0, event.ydata)):
             blocker = QSignalBlocker(spin)

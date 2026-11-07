@@ -55,7 +55,8 @@ def _radial_orbits(expressions, center, bounds, guards=()):
 
     def circle(radius, family):
         return {"points": np.column_stack((float(cx)+radius*np.cos(angles),
-                                          float(cy)+radius*np.sin(angles))), "family": family}
+                                          float(cy)+radius*np.sin(angles))),
+                "family": family, "center": np.array([float(cx), float(cy)])}
     if pr == 0:
         for fraction in (0.35, 0.25, 0.5, 0.7, 0.15, 0.07, 0.03):
             radius = room*fraction
@@ -80,16 +81,16 @@ def _radial_orbits(expressions, center, bounds, guards=()):
             kind = "semistable"
         else:
             kind = "stability undetermined"
-        orbits.append(circle(radius, False))
+        orbits.append({**circle(radius, False), "stability": kind})
         rows.append(f"Limit cycle: {kind}.")
     return orbits, rows
 
 
-def _returns(field, center, radii, bounds, cancelled, paths=False):
+def _returns(field, center, radii, bounds, cancelled, paths=False, resolution=320, time_direction=1):
     radii = np.asarray(radii, dtype=float)
     count = len(radii)
     scale = min(bounds[1]-bounds[0], bounds[3]-bounds[2])
-    step = scale / 320
+    step = scale / resolution
     positions = np.tile(center, (count, 1))
     positions[:, 0] += radii
     start = positions.copy()
@@ -100,7 +101,7 @@ def _returns(field, center, radii, bounds, cancelled, paths=False):
         with np.errstate(all="ignore"):
             values = np.asarray(field(points), dtype=float)
             lengths = np.linalg.norm(values, axis=1)
-            direction = values / np.maximum(lengths[:, None], 1e-300)
+            direction = time_direction * values / np.maximum(lengths[:, None], 1e-300)
         valid = np.isfinite(direction).all(axis=1) & (lengths > 1e-14)
         return np.where(valid[:, None], direction, 0), valid
 
@@ -108,13 +109,13 @@ def _returns(field, center, radii, bounds, cancelled, paths=False):
     orientation = np.sign(first[:, 1])
     live &= orientation != 0
     travelled = np.zeros(count)
-    for iteration in range(7680):
+    for iteration in range(24 * resolution):
         if iteration % 32 == 0 and cancelled():
             return answer, history
         if not live.any():
             break
         # Prevent tiny trial circles from being traversed in one coarse step.
-        h = np.minimum(step, np.maximum(radii, scale*1e-6)/32)
+        h = np.minimum(step, np.maximum(radii, scale*1e-6)/(resolution/10))
         k1, ok1 = velocity(positions)
         k2, ok2 = velocity(positions + h[:, None]*k1/2)
         k3, ok3 = velocity(positions + h[:, None]*k2/2)
@@ -192,7 +193,7 @@ def find_periodic_orbits(field, bounds, anchors, cancelled=lambda: False):
                 points = np.asarray(paths[0])
                 if len(points) > 24 and np.linalg.norm(points[-1]-points[0]) < scale*1e-7:
                     points[-1] = points[0]
-                    orbits.append({"points": points, "family": True})
+                    orbits.append({"points": points, "family": True, "center": center})
                     rows.append("Closed-orbit family: one representative shown.")
             continue
         brackets = [(radii[i], radii[i+1], drift[i], drift[i+1])
@@ -238,8 +239,54 @@ def find_periodic_orbits(field, bounds, anchors, cancelled=lambda: False):
                        for item in orbits):
                     continue
                 points[-1] = points[0]
-                orbits.append({"points": points, "family": False})
+                orbits.append({"points": points, "family": False, "center": center,
+                               "stability": "attracting" if attracting else "repelling"})
                 rows.append("Numerically detected limit cycle: "
                             + ("attracting." if attracting else "repelling."))
     rows.append("Periodic-orbit search is limited to the searched 2D region and may miss cycles.")
     return orbits, rows
+
+
+def inspect_periodic_orbit(field, divergence, bounds, orbit):
+    """Measure one oriented return of a detected orbit in original equation time."""
+    center = orbit["center"]
+    radius = orbit["points"][0, 0] - center[0]
+    if radius <= 0:
+        raise ValueError("The orbit has no usable positive-ray section.")
+    radii = radius * np.linspace(.95, 1.05, 25)
+    middle = len(radii) // 2
+    radii[middle] = radius
+    probes = center + np.column_stack((radii, np.zeros_like(radii)))
+    vectors = field(probes)
+    crossing = vectors[:, 1]
+    transverse = np.isfinite(vectors).all(axis=1) & (np.abs(crossing) > 1e-5 * np.linalg.norm(vectors, axis=1))
+    if not transverse[middle]:
+        raise ValueError("The flow is nearly tangent to this section.")
+    returned, _ = _returns(field, center, radii, bounds, lambda: False, resolution=640)
+    returned[~transverse | (np.signbit(crossing) != np.signbit(crossing[middle]))] = np.nan
+    # Roundoff is amplified by the forward flow around a repelling cycle.
+    # Measure its geometry and time backwards, leaving the displayed map forward.
+    backward = orbit.get("stability") == "repelling"
+    end, paths = _returns(field, center, [radius], bounds, lambda: False, paths=True,
+                          resolution=960, time_direction=-1 if backward else 1)
+    if not backward:
+        returned[middle] = end[0]
+    period = log_multiplier = None
+    closure = abs(end[0] - radius)
+    points = orbit["points"]
+    if np.isfinite(closure) and closure <= 1e-4 * radius and len(paths[0]) > 2:
+        points = np.asarray(paths[0])
+        speed = np.linalg.norm(field(points), axis=1)
+        if np.all(np.isfinite(speed) & (speed > 0)):
+            inverse_speed = 1 / speed
+            ds = np.linalg.norm(np.diff(points, axis=0), axis=1)
+            def integrate(values):
+                return float(ds @ ((values[:-1] + values[1:]) / 2))
+            estimate = integrate(inverse_speed)
+            if np.isfinite(estimate) and estimate > 0:
+                period = estimate
+            values = divergence(points)
+            if period is not None and np.isfinite(values).all():
+                log_multiplier = integrate(values * inverse_speed)
+    return dict(points=points, center=center, radius=radius, radii=radii, returns=returned,
+                period=period, closure=closure, log_multiplier=log_multiplier, backward=backward)
