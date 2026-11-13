@@ -18,7 +18,7 @@ from parameter_notation import (
     canonicalize_parameter_notation, display_parameter_name,
     format_parameter_definitions, infer_parameter_names,
     ENCODED_PARAMETER_PATTERN, display_parameter_expression,
-    subscript_exit_position,
+    EDITABLE_SUBSCRIPT, has_incomplete_subscript, subscript_exit_position,
 )
 from equilibrium_algebra import (
     analyze_algebraic_equilibria, exact_point_text, exact_point_jacobian,
@@ -42,7 +42,7 @@ from PySide6.QtOpenGL import (
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QFormLayout, QGroupBox, QLabel, QLineEdit,
+    QGridLayout, QFormLayout, QGroupBox, QLabel, QLineEdit, QLayout,
     QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox,
     QSplitter, QAbstractSpinBox, QComboBox, QStackedWidget, QSizePolicy, QFrame, QScrollArea,
     QTabWidget, QTabBar, QFileDialog, QTextEdit, QToolButton, QGraphicsOpacityEffect, QSpacerItem,
@@ -377,6 +377,10 @@ def format_formula_input(text, parameter_names=()):
 @lru_cache(maxsize=128)
 def _format_formula_cached(text, parameter_names):
     """Render powers and implicit products as typographic math in-place."""
+    if has_incomplete_subscript(text):
+        return text
+    original = text
+    trailing_space = text[len(text.rstrip()):]
     text = normalize_display_expression(text)
     text = _insert_implicit_multiplication(
         text, parameter_names, preserve_scientific_prefix=True
@@ -417,9 +421,9 @@ def _format_formula_cached(text, parameter_names):
         flags=re.UNICODE,
     )
     text = re.sub(r"\bpi\b", "π", text)
-    text = display_parameter_expression(text, FUNCTIONS)
+    text = display_parameter_expression(text, FUNCTIONS, original)
     text = _display_absolute_bars(text)
-    return _hide_product_symbols(text, parameter_names).replace("-", "−")
+    return _hide_product_symbols(text, parameter_names).replace("-", "−") + trailing_space
 BINARY_OPS = {
     ast.Add: operator.add, ast.Sub: operator.sub,
     ast.Mult: operator.mul, ast.Div: operator.truediv,
@@ -1561,7 +1565,8 @@ def compile_glsl(node, params):
         raise ValueError(f"Unknown variable: {node.id}")
     if isinstance(node, ast.UnaryOp) and type(node.op) in UNARY_OPS:
         symbol = "+" if isinstance(node.op, ast.UAdd) else "-"
-        return f"({symbol}{compile_glsl(node.operand, params)})"
+        operand = compile_glsl(node.operand, params)
+        return f"({symbol}({operand}))"
     if isinstance(node, ast.BinOp) and type(node.op) in BINARY_OPS:
         left = compile_glsl(node.left, params)
         right = compile_glsl(node.right, params)
@@ -1596,14 +1601,20 @@ def compile_glsl(node, params):
 
 class _ParameterSubscriptHighlighter(QSyntaxHighlighter):
     def highlightBlock(self, text):
-        for match in re.finditer(r"(?<![A-Za-zΑ-Ωα-ω])([A-Za-zΑ-Ωα-ω]+)(_)([A-Za-zΑ-Ωα-ω0-9]+)", text):
-            hidden = QTextCharFormat()
-            hidden.setFontPointSize(0.1)
-            hidden.setForeground(Qt.GlobalColor.transparent)
-            self.setFormat(match.start(2), 1, hidden)
-            script = QTextCharFormat()
-            script.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSubScript)
-            self.setFormat(match.start(3), len(match[3]), script)
+        hidden = QTextCharFormat()
+        hidden.setFontPointSize(0.1)
+        hidden.setForeground(Qt.GlobalColor.transparent)
+        script = QTextCharFormat()
+        script.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSubScript)
+        for match in EDITABLE_SUBSCRIPT.finditer(text):
+            if match.lastgroup == "unicode":
+                continue
+            start, end = match.span(match.lastgroup)
+            delimiter_width = 2 if match.lastgroup == "group" else 1
+            self.setFormat(start-delimiter_width, delimiter_width, hidden)
+            self.setFormat(start, end-start, script)
+            if end < match.end():
+                self.setFormat(end, match.end()-end, hidden)
 
 
 class NotationLineEdit(QTextEdit):
@@ -1694,6 +1705,8 @@ class NotationLineEdit(QTextEdit):
             end = subscript_exit_position(self.text(), self.cursorPosition())
             if end is not None:
                 self.setCursorPosition(end)
+                if self.text()[end-1] == ")":
+                    return
                 if end < len(self.text()) and self.text()[end].isspace():
                     self.setCursorPosition(end+1)
                 else:
@@ -2640,7 +2653,8 @@ class FlowCanvas(QOpenGLWidget):
         gl.glClearColor(background, background, background, 1.0)
         gl.glClear(self.COLOR_BIT)
         self.vao.bind()
-        if self.background_texture is not None and self.background_texture.isCreated():
+        if (self.background_program is not None and self.background_texture is not None
+                and self.background_texture.isCreated()):
             self._fit_background_to_view()
             gl.glViewport(*self._background_viewport)
             gl.glDisable(self.BLEND)
@@ -3151,6 +3165,9 @@ class Flow3DCanvas(QWidget):
         self.canvas.draw_idle()
 
 
+MUTUAL_INHIBITION = "Mutual inhibition"
+MICHAELIS_MENTEN = "Michaelis–Menten"
+FISHER_FRONT = "Fisher travelling front"
 ODE_MODEL_PRESETS = {
     "Harmonic oscillator": ("y", "-x", ""),
     "Damped oscillator": ("y", "-2*ζ*ω*y - ω^2*x", "ζ=0.1, ω=1"),
@@ -3161,6 +3178,10 @@ ODE_MODEL_PRESETS = {
     ),
     "Brusselator": ("a - (b+1)*x + x^2*y", "b*x - x^2*y", "a=1, b=3"),
     "Linear saddle": ("x", "-y", ""),
+    MUTUAL_INHIBITION: ("k1*S-k2*x-k_deg*x*y", "k_rev*(Y_t-y)-k_conv*x*y",
+                        "k1=1, S=1, k2=1, k_deg=1, k_rev=1, k_conv=1, Y_t=1"),
+    MICHAELIS_MENTEN: ("κ_s*y-x*(1-y)", "(x*(1-y)-κ_m*y)/ε", "κ_s=1, κ_m=1.5, ε=0.05"),
+    FISHER_FRONT: ("y", "-v*y-x*(1-x)", "v=2"),
 }
 
 ODE_3D_MODEL_PRESETS = {
@@ -3306,8 +3327,9 @@ class InlineMathObject(QPyTextObject):
 
 class EquilibriumInfo(QTextEdit):
     """Wrapping, selectable interface text with inline TeX mathematics."""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, line_spacing=1.0):
         super().__init__(parent)
+        self._line_spacing = line_spacing
         self.setReadOnly(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -3330,7 +3352,10 @@ class EquilibriumInfo(QTextEdit):
         normal.setFont(self.font())
         normal.setForeground(QColor(foreground))
         block = QTextBlockFormat()
-        block.setBottomMargin(5)
+        block.setBottomMargin(5 * self._line_spacing)
+        if self._line_spacing != 1.0:
+            block.setLineHeight(
+                100 * self._line_spacing, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
         for index, row in enumerate(rows):
             if index:
                 cursor.insertBlock()
@@ -3430,6 +3455,100 @@ class InspectEquilibriumButton(QToolButton):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
         painter.drawEllipse(QPointF(16, 13), 2.7, 2.7)
+
+
+class _ParameterValueEdit(QLineEdit):
+    def sizeHint(self):
+        hint = super().sizeHint()
+        metrics = self.fontMetrics()
+        width = max(metrics.horizontalAdvance("0.000"), metrics.horizontalAdvance(self.text()))
+        hint.setWidth(width + 14)
+        return hint
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(self.fontMetrics().horizontalAdvance("0.000") + 14)
+        return hint
+
+
+class _ParameterLayout(QLayout):
+    """Wrap whole label/value pairs and leave unused row space at the right."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(9)
+
+    def addItem(self, item):
+        self._items.append(item)
+        self.invalidate()
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        if self.itemAt(index) is not None:
+            item = self._items.pop(index)
+            self.invalidate()
+            return item
+        return None
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._arrange(QRect(0, 0, width, 0), measure=True)
+
+    def minimumSize(self):
+        size = QSize(0, 0)
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        height = self._arrange(rect)
+        # The sidebar can otherwise compress wrapped rows below their height.
+        panel = self.parentWidget()
+        if panel.minimumHeight() != height:
+            panel.setMinimumHeight(height)
+
+    def _arrange(self, rect, measure=False):
+        rows, row = [], []
+        row_width = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            editor = item.widget().layout().itemAt(1)
+            extra = editor.sizeHint().width() - editor.minimumSize().width()
+            width = min(hint.width() - extra, rect.width())
+            if row and (len(row) == 4 or row_width + self.spacing() + width > rect.width()):
+                rows.append((row, row_width))
+                row, row_width = [], 0
+            row_width += width + (self.spacing() if row else 0)
+            row.append((item, width, extra, hint.height()))
+        if row:
+            rows.append((row, row_width))
+
+        y = 0
+        for row, row_width in rows:
+            row_height = max(height for _, _, _, height in row)
+            if not measure:
+                spare = rect.width() - row_width
+                x = 0
+                for item, width, extra, height in row:
+                    growth = min(spare, extra)
+                    item.setGeometry(QRect(rect.x() + x, rect.y() + y, width + growth, height))
+                    x += width + growth + self.spacing()
+                    spare -= growth
+            y += row_height + 4
+        return y - 4 if rows else 0
 
 
 class DynamicalSystemLab(QMainWindow):
@@ -3612,6 +3731,8 @@ class DynamicalSystemLab(QMainWindow):
         self.fx_input = NotationLineEdit(format_formula_input("x^3 - 2*x*y^2"))
         self.fy_input = NotationLineEdit(format_formula_input("2*x^2*y - y^3"))
         self.fz_input = NotationLineEdit()
+        for editor in (self.fx_input, self.fy_input, self.fz_input):
+            editor.setToolTip("Subscripts: enter k_deg xy or k_(deg)xy to put only deg below k.")
         self.fx_input.setPlaceholderText("e.g. x^2 - y")
         self.fy_input.setPlaceholderText("e.g. x + y^2")
         self._active_formula_editor = self.fx_input
@@ -3688,13 +3809,7 @@ class DynamicalSystemLab(QMainWindow):
         self.param_input.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.param_input.textChanged.connect(self._on_parameters_edited)
         self.parameter_fields = QWidget()
-        self.parameter_form = QGridLayout(self.parameter_fields)
-        self.parameter_form.setContentsMargins(0, 0, 0, 0)
-        self.parameter_form.setHorizontalSpacing(6)
-        self.parameter_form.setVerticalSpacing(4)
-        self.parameter_form.setColumnStretch(1, 1)
-        self.parameter_form.setColumnStretch(3, 1)
-        self.parameter_form.setColumnStretch(5, 1)
+        self.parameter_form = _ParameterLayout(self.parameter_fields)
         self.parameter_fields.hide()
         parameter_layout.addWidget(self.parameter_fields)
         self._set_parameter_section_visible(False)
@@ -3912,7 +4027,7 @@ class DynamicalSystemLab(QMainWindow):
         equilibrium_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         equilibrium_layout = QVBoxLayout(equilibrium_box)
         equilibrium_layout.setContentsMargins(8, 7, 8, 7)
-        self.equilibrium_info = EquilibriumInfo()
+        self.equilibrium_info = EquilibriumInfo(line_spacing=1.1)
         self.equilibrium_info.setPlainText("Apply a system to find its equilibrium points.")
         self.equilibrium_info.setMinimumHeight(80)
         self.equilibrium_info.setStyleSheet("padding: 3px 2px;")
@@ -4026,8 +4141,8 @@ class DynamicalSystemLab(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(10, 10, 10, 10)
-        initial_box = QGroupBox("Initial-value solution (original equation time)")
-        form = QGridLayout(initial_box)
+        self.initial_box = QGroupBox("Initial-value solution (original equation time)")
+        form = QGridLayout(self.initial_box)
         self.initial_spins = [self.make_spin(value, -1e6, 1e6, 0.1) for value in (1, 0, 0)]
         for spin in self.initial_spins:
             # Clicked coordinates must not be rounded onto an equilibrium.
@@ -4041,7 +4156,8 @@ class DynamicalSystemLab(QMainWindow):
             form.addWidget(spin, 0, column * 2 + 1)
             spin.valueChanged.connect(self._on_initial_changed)
         self.duration = self.make_spin(20, 0.001, 1000, 1)
-        form.addWidget(QLabel("End time"), 1, 0)
+        self.duration_label = QLabel("End time")
+        form.addWidget(self.duration_label, 1, 0)
         form.addWidget(self.duration, 1, 1)
         self.duration.valueChanged.connect(self._invalidate_selected_solution)
         self.trace_btn = QPushButton("Trace solution")
@@ -4051,7 +4167,12 @@ class DynamicalSystemLab(QMainWindow):
         self.show_selected.setChecked(True)
         self.show_selected.toggled.connect(self._on_selected_visibility_changed)
         form.addWidget(self.show_selected, 1, 4, 1, 2)
-        layout.addWidget(initial_box)
+        self.front_btn = QPushButton("Trace Fisher front")
+        self.front_btn.setToolTip("Start just off (u,w) = (1,0) along the descending unstable branch.")
+        self.front_btn.clicked.connect(self._trace_fisher_front)
+        form.addWidget(self.front_btn, 2, 0, 1, 6)
+        self.front_btn.hide()
+        layout.addWidget(self.initial_box)
         self.solution_status = QLabel("Click the 2D phase plot or enter an initial point, then Trace solution.\nPlayback and direction normalization do not change this solution.")
         self.solution_status.setWordWrap(True)
         layout.addWidget(self.solution_status)
@@ -4187,6 +4308,31 @@ class DynamicalSystemLab(QMainWindow):
         del blocker
         self.trace_solution()
 
+    def _flow_biology_preset(self):
+        if self._dimension == "2D" and self._coordinates == "Cartesian":
+            name = self.model_selector.currentText()
+            if name in (MICHAELIS_MENTEN, FISHER_FRONT):
+                return name
+        return None
+
+    def _trace_fisher_front(self):
+        if self._auto_apply_timer.isActive():
+            self._auto_apply_timer.stop()
+            self.apply_model()
+        if not self._last_apply_valid or self._flow_biology_preset() != FISHER_FRONT:
+            return
+        speed = self.params["v"]
+        if speed < 0:
+            self.solution_status.setText("Choose v ≥ 0 for this right-moving front experiment.")
+            return
+        offset = 1e-5
+        growth = 1 / (math.hypot(speed, 2)/2 + speed/2)
+        for spin, value in zip(self.initial_spins, (1-offset, -growth*offset)):
+            with QSignalBlocker(spin):
+                spin.setValue(value)
+        self._initial_states["2D"] = tuple(spin.value() for spin in self.initial_spins)
+        self._trace_from_controls()
+
     def _dismiss_selected_trace(self):
         if (self._selected_solution is None and self._solution_request is None
                 or not self.show_selected.isChecked()):
@@ -4206,6 +4352,17 @@ class DynamicalSystemLab(QMainWindow):
                 or self._solution_request is not None and self._solution_request[0] != signature):
             self._invalidate_selected_solution()
         self._sync_parameter_fields()
+        preset = self._flow_biology_preset()
+        fisher = preset == FISHER_FRONT
+        self.front_btn.setVisible(fisher)
+        self.initial_box.setTitle({
+            FISHER_FRONT: "Initial-value solution in travelling coordinate ξ",
+            MICHAELIS_MENTEN: "Full system and quasi-steady approximation (slow time τ)",
+        }.get(preset, "Initial-value solution (original equation time)"))
+        self.duration_label.setText({FISHER_FRONT: "End ξ", MICHAELIS_MENTEN: "End τ"}.get(preset, "End time"))
+        initial_names = {FISHER_FRONT: ("u₀", "w₀"), MICHAELIS_MENTEN: ("s₀", "c₀")}
+        for label, name in zip(self.initial_labels, initial_names.get(preset, ("x₀", "y₀"))):
+            label.setText(name)
 
     def _focus_short_trace(self, points, plot_scale):
         if self._dimension != "2D" or len(points) < 2 or plot_scale is None:
@@ -4270,6 +4427,7 @@ class DynamicalSystemLab(QMainWindow):
                 self._solution_process.submit(key, {
                     "fields": fields, "params": dict(self.params), "initial": initial,
                     "duration": self.duration.value(), "dt": self.dt.value(), "plot_scale": plot_scale,
+                    "compare_qss": self._flow_biology_preset() == MICHAELIS_MENTEN,
                 }, "selected_trajectory")
                 return
             times, points, reason = integrate_trajectory(
@@ -4329,7 +4487,20 @@ class DynamicalSystemLab(QMainWindow):
         solution = self._selected_solution
         solution["experiment"] = self.experiment_data()
         times = solution["times"]
-        self.solution_status.setText(f"{solution['reason']}; t = {times[0]:g} to {times[-1]:g}; {len(times)} samples\nOriginal equation time; adaptive integration with relative tolerance 10⁻⁷.")
+        preset = self._flow_biology_preset()
+        coordinate = "ξ" if preset == FISHER_FRONT else "τ" if preset == MICHAELIS_MENTEN else "t"
+        note = "Original equation time; adaptive integration with relative tolerance 10⁻⁷."
+        if preset == FISHER_FRONT:
+            note = ("Co-moving coordinate ξ. A nonnegative monotone Fisher front requires v ≥ 2. "
+                    "The plotted profile is a finite initial-value trace near the unstable branch.")
+        elif "qss" in solution:
+            if solution["qss"] is None:
+                note = "QSS needs s₀ ≥ 0, 0 ≤ c₀ ≤ 1, ε > 0 and 0 ≤ κₛ < κₘ."
+            else:
+                error = np.max(np.abs(solution["points"][:, 0]-solution["qss"][:, 0]))
+                note = f"Dashed: quasi-steady approximation. Max |s − s_QSS| on this interval ≈ {error:.4g}."
+        self.solution_status.setText(f"{solution['reason']}; {coordinate} = {times[0]:g} to {times[-1]:g}; "
+                                     f"{len(times)} samples\n{note}")
         self._draw_time_series()
 
     def _show_solution_error(self, message):
@@ -4349,28 +4520,46 @@ class DynamicalSystemLab(QMainWindow):
     def _draw_time_series(self):
         figure = self.time_figure
         figure.clear()
-        ax = figure.add_subplot(111)
+        data = self._selected_solution
+        qss = data.get("qss") if data is not None else None
+        error_ax = None
+        if qss is not None:
+            ax, error_ax = figure.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": (3, 1)})
+        else:
+            ax = figure.add_subplot(111)
         dark = self.dark_mode_check.isChecked()
         background, foreground = ("#000000", "#eeeeee") if dark else ("#ffffff", "#111111")
         figure.set_facecolor(background)
-        ax.set_facecolor(background)
-        ax.tick_params(colors=foreground)
-        for spine in ax.spines.values():
-            spine.set_color(foreground)
-        ax.set_xlabel("t (original equation time)", color=foreground, fontfamily="Times New Roman")
+        for plot in figure.axes:
+            plot.set_facecolor(background)
+            plot.tick_params(colors=foreground)
+            for spine in plot.spines.values():
+                spine.set_color(foreground)
+            plot.grid(alpha=0.15, color=foreground)
+        preset = self._flow_biology_preset()
+        labels, xlabel = {
+            MICHAELIS_MENTEN: (("s", "c"), "τ (slow time)"),
+            FISHER_FRONT: (("u", "w"), "ξ (travelling coordinate)"),
+        }.get(preset, (("x", "y", "z"), "t (original equation time)"))
+        xlabel_axis = ax if error_ax is None else error_ax
+        xlabel_axis.set_xlabel(xlabel, color=foreground, fontfamily="Times New Roman")
         ax.set_ylabel("State", color=foreground, fontfamily="Times New Roman")
-        ax.grid(alpha=0.15, color=foreground)
-        if self._selected_solution is not None:
-            data = self._selected_solution
+        if data is not None:
             colors = ("#75bdff", "#ffac6d", "#cc9dff") if dark else ("#2563ad", "#bf5714", "#8449b5")
-            for index, name in enumerate(("x", "y", "z")[:data["points"].shape[1]]):
+            for index, name in enumerate(labels[:data["points"].shape[1]]):
                 ax.plot(data["times"], data["points"][:, index], label=name, color=colors[index], linewidth=1.2)
+                if qss is not None:
+                    ax.plot(data["times"], qss[:, index], "--", color=colors[index],
+                            label=f"{name} (QSS)", linewidth=1)
+            if error_ax is not None:
+                error_ax.plot(data["times"], np.abs(data["points"][:, 0]-qss[:, 0]), color=colors[0])
+                error_ax.set_ylabel("|s − s_QSS|", color=foreground)
             legend = ax.legend(facecolor=background, edgecolor="none")
             for text in legend.get_texts():
                 text.set_color(foreground)
                 text.set_fontfamily("Times New Roman")
         else:
-            ax.text(0.5, 0.5, "Trace an initial-value solution to show x(t), y(t), z(t).",
+            ax.text(0.5, 0.5, "Trace an initial-value solution to display its profile.",
                     transform=ax.transAxes, ha="center", color=foreground, wrap=True)
         for label in (*ax.get_xticklabels(), *ax.get_yticklabels()):
             label.set_fontfamily("Times New Roman")
@@ -4385,29 +4574,39 @@ class DynamicalSystemLab(QMainWindow):
                 if item.widget() is not None:
                     item.widget().deleteLater()
             self._parameter_editors = {}
-            for index, name in enumerate(self.params):
-                editor = QLineEdit()
-                editor.setMinimumWidth(0)
-                editor.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            equation_font = self.fx_input.document().defaultFont()
+            for name in self.params:
+                pair = QWidget(self.parameter_fields)
+                pair_layout = QHBoxLayout(pair)
+                pair_layout.setContentsMargins(0, 0, 0, 0)
+                pair_layout.setSpacing(4)
+                editor = _ParameterValueEdit(pair)
+                editor.setFont(equation_font)
+                editor.setStyleSheet("QLineEdit { padding-left: 4px; padding-right: 4px; }")
                 editor.setToolTip("Finite numeric value; Enter or leave the field to apply. Mouse wheel does not edit it.")
                 editor.editingFinished.connect(lambda symbol=name: self._commit_parameter_field(symbol))
-                label = QLabel()
+                label = QLabel(pair)
                 rendered_name = display_parameter_name(name, FUNCTIONS)
                 rendered_name = re.sub(
                     r"([A-Za-zΑ-Ωα-ω]+)_([A-Za-zΑ-Ωα-ω0-9]+)",
                     lambda m: html.escape(m[1]) + "<sub>" + html.escape(m[2]) + "</sub>",
                     rendered_name)
                 label.setText(rendered_name)
-                label.setStyleSheet("font-family:Times New Roman; font-size:12pt;")
-                row, column = index // 3, (index % 3) * 2
-                self.parameter_form.addWidget(label, row, column)
-                self.parameter_form.addWidget(editor, row, column + 1)
+                label.setToolTip(rendered_name)
+                label.setMinimumWidth(1)
+                label.setFont(equation_font)
+                pair_layout.addWidget(label)
+                pair_layout.addWidget(editor, 1)
+                self.parameter_form.addWidget(pair)
                 self._parameter_editors[name] = editor
         for name, editor in self._parameter_editors.items():
             if not editor.hasFocus():
                 # Keep extra digits only when the raw Params value actually has them;
                 # never display a rounded value while calculating another value.
-                editor.setText(format(self.params[name], ".12g"))
+                value = format(self.params[name], ".12g")
+                if value != editor.text():
+                    editor.setText(value)
+                    editor.updateGeometry()
         self._set_parameter_section_visible(bool(self.params))
 
     def _set_parameter_section_visible(self, visible):
@@ -4430,6 +4629,7 @@ class DynamicalSystemLab(QMainWindow):
             params = dict(self.params)
             params[name] = value
             editor.setText(f"{value:.3f}")
+            editor.updateGeometry()
             self.param_input.setText(", ".join(
                 f"{display_parameter_name(symbol)}={format(number, '.12g')}"
                 for symbol, number in params.items()))
@@ -5101,6 +5301,15 @@ class DynamicalSystemLab(QMainWindow):
         if self._dimension == "3D" and name in ODE_3D_MODEL_PRESETS:
             self._initial_states["3D"] = ODE_3D_MODEL_PRESETS[name][4]
             self._restore_initial_controls()
+        if name == MICHAELIS_MENTEN:
+            self._initial_states["2D"] = (1, 0, 0)
+            self._restore_initial_controls()
+            self.duration.setValue(3)
+            self._set_view_bounds((0, 1.15, 0, 1.05))
+        elif name == FISHER_FRONT:
+            self.first_quadrant.setChecked(False)
+            self.duration.setValue(40)
+            self._set_view_bounds((-.15, 1.15, -.45, .25))
         self._mode_states[self._editor_state_key()] = self._read_editor_state()
         self._auto_apply_timer.start()
 
@@ -5498,9 +5707,33 @@ class DynamicalSystemLab(QMainWindow):
         if self._dimension == "2D":
             xmin, xmax, ymin, ymax = self._active_bounds
             local_radius = 0.12 * min(xmax - xmin, ymax - ymin)
-        dialog = EquilibriumInspector(self, self._equilibrium_results, fields, dict(self.params),
+        results = self._equilibrium_results
+        if self._is_mutual_inhibition():
+            results = [(point, {**details, "physical_status": self._mutual_equilibrium_status(point)})
+                       for point, details in results]
+        dialog = EquilibriumInspector(self, results, fields, dict(self.params),
                                       local_radius, self.dark_mode_check.isChecked())
         dialog.open()
+
+    def _is_mutual_inhibition(self):
+        return (self._dimension == "2D" and self.model_selector.currentText() == MUTUAL_INHIBITION
+                and self.params.keys() >= {"k1", "S"}
+                and all(name in self.params or name.replace("_", "") in self.params
+                        for name in ("k_rev", "k_conv", "Y_t")))
+
+    def _mutual_parameter(self, name):
+        # Earlier experiment files used the same parameter names without underscores.
+        return self.params[name if name in self.params else name.replace("_", "")]
+
+    def _mutual_equilibrium_status(self, point):
+        total = self._mutual_parameter("Y_t")
+        if total <= 0:
+            return "Physical range unavailable (Yₜ must be positive)."
+        x, y = point
+        tolerance = 1e-9 * max(1.0, total)
+        if x >= -1e-9 and -tolerance <= y <= total+tolerance:
+            return "Inside the physical range."
+        return "Outside the physical range."
 
     def _on_equilibrium_complete(self, key, result):
         if key != self._equilibrium_request_key:
@@ -5528,6 +5761,24 @@ class DynamicalSystemLab(QMainWindow):
         foreground = "#ffffff" if dark else "#000000"
         self._equilibrium_base_rows = list(rows)
         displayed = list(rows)
+        if self._is_mutual_inhibition():
+            total = self._mutual_parameter("Y_t")
+            if total > 0:
+                displayed.append(f"Physical range: X ≥ 0, 0 ≤ Y ≤ Yₜ = {total:g}.")
+                outward = [edge for edge, is_outward in (
+                    ("X = 0", self.params["k1"]*self.params["S"] < 0),
+                    ("Y = 0", self._mutual_parameter("k_rev") < 0),
+                    ("Y = Yₜ", self._mutual_parameter("k_conv") < 0),
+                ) if is_outward]
+                displayed.append("Boundary flow can point outward at " + ", ".join(outward) + "."
+                                 if outward else "Boundary flow points inward or tangent throughout.")
+                outside = [point for point, _ in self._equilibrium_results
+                           if self._mutual_equilibrium_status(point) == "Outside the physical range."]
+                if outside:
+                    coordinates = ", ".join(f"({x:.5g}, {y:.5g})" for x, y in outside)
+                    displayed.append("Equilibria outside the physical range: " + coordinates)
+            else:
+                displayed.append("Physical range unavailable (Yₜ must be positive).")
         if self.show_equilibria.isChecked() and self._periodic_key == self._periodic_model_key():
             displayed.extend(self._periodic_rows)
         self._equilibrium_rows = displayed
@@ -5699,12 +5950,19 @@ class DynamicalSystemLab(QMainWindow):
         ax.grid(True, color=grid_color, alpha=0.10, linestyle="-")
         ax.axhline(0, color=secondary, linewidth=0.55, alpha=0.28)
         ax.axvline(0, color=secondary, linewidth=0.55, alpha=0.28)
-        ax.set_xlabel("x", color=primary, labelpad=2)
-        ax.set_ylabel("y", color=primary, labelpad=2)
+        mutual = self._is_mutual_inhibition()
+        x_label, y_label = {MICHAELIS_MENTEN: ("s", "c"), FISHER_FRONT: ("u", "w")}.get(
+            self._flow_biology_preset(), ("X", "Y") if mutual else ("x", "y"))
+        ax.set_xlabel(x_label, color=primary, labelpad=2)
+        ax.set_ylabel(y_label, color=primary, labelpad=2)
         ax.set_title("PHASE FLOW", color=primary, pad=8, fontsize=10, fontweight="bold")
         figure.subplots_adjust(left=0.10, right=0.90,
             bottom=PHASE_BOTTOM_MARGIN*ratio/pixel_height,
             top=1-PHASE_TOP_MARGIN*ratio/pixel_height)
+        if mutual:
+            low, high = max(0, ymin), min(self._mutual_parameter("Y_t"), ymax)
+            if xmax > max(0, xmin) and high > low:
+                ax.fill_between([max(0, xmin), xmax], low, high, color="#4b93d0", alpha=.12, zorder=0)
 
         xx = np.linspace(xmin, xmax, 32)
         yy = np.linspace(ymin, ymax, 32)

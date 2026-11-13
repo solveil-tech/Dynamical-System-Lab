@@ -7,6 +7,7 @@ import ast
 import re
 import numpy as np
 import sympy as sp
+from sympy.polys.polyerrors import UnsolvableFactorError
 
 X, MU = sp.symbols("x mu", real=True)
 
@@ -213,10 +214,10 @@ def analyze(data):
             notes.append("Non-isolated nonhyperbolic set present; f = fₓ = 0 alone does not certify a bifurcation.")
         else:
             try:
-                solutions = sp.solve_poly_system([numerator, dn], X, MU)
+                solutions = sp.solve_poly_system([numerator, dn], X, MU, strict=True)
                 candidates = solutions or []
                 exact = True
-            except (NotImplementedError, sp.PolynomialError):
+            except (NotImplementedError, sp.PolynomialError, UnsolvableFactorError):
                 candidates = numerical_critical_points(expression, derivative, bounds)
                 notes.append("Algebraic solution incomplete; bounded numerical candidates shown.")
     else:
@@ -243,7 +244,8 @@ def analyze(data):
                              mu_text=sp.latex(mm) if not mm.has(sp.Float) else pretty(mm),
                              x_text=sp.latex(xx) if not xx.has(sp.Float) else pretty(xx),
                              kind=classify(expression, xx, mm, factors) if certified else "Numerical nonhyperbolic candidate (type unconfirmed)",
-                             stability=stability(expression, {X: xx, MU: mm})))
+                             stability=stability(expression, {X: xx, MU: mm}) if certified
+                             else "Inconclusive at a numerical critical point"))
     if not critical and expression != 0:
         notes.append("No isolated critical point detected inside the selected window.")
     segments = contours(expression, bounds, guards)
@@ -305,11 +307,63 @@ def roots_at(expression, mu, low, high):
     output = []
     for root in sorted(result):
         with np.errstate(all="ignore"):
-            residual, domain = float(fn(root, mu)), float(guard(root, mu))
-        if np.isfinite(residual) and abs(residual) < 1e-6 and np.isfinite(domain) and domain != 0:
+            try:
+                domain = float(guard(root, mu))
+                if not np.isfinite(domain) or domain == 0:
+                    continue
+                residual = float(fn(root, mu))
+            except (ArithmeticError, TypeError, ValueError):
+                continue
+        if np.isfinite(residual) and abs(residual) < 1e-6:
             if not output or abs(root-output[-1]) > 1e-7:
                 output.append(root)
     return output
+
+
+def phase_line(data):
+    expression, guards = scalar_model(data["formula"])
+    mu, (low, high) = data["mu"], data["bounds"]
+    denominator = sp.fraction(sp.together(expression))[1]
+    guards = [*guards, denominator]
+    holes = []
+    for guard in guards:
+        excluded = roots_at(guard, mu, low, high)
+        if excluded is None:
+            raise ValueError("The expression is undefined on this slice.")
+        holes.extend(excluded)
+    holes = sorted(set(holes))
+    roots = roots_at(expression, mu, low, high)
+    if roots is None:
+        return dict(roots=[], arrows=[], holes=holes, stationary=True)
+    roots = sorted({min(high, max(low, x)) for x in roots
+                    if all(abs(x-hole) > 1e-7 for hole in holes)})
+    fn = numeric(expression)
+    arrows, sides = [], {}
+    cuts = sorted({low, high, *roots, *(x for x in holes if low < x < high)})
+    for a, b in zip(cuts, cuts[1:]):
+        samples = grid_value(fn, a+(b-a)*np.array([.25, .5, .75]), mu)
+        direction = int(np.sign(samples[0])) if np.isfinite(samples).all() else 0
+        if not direction or not np.all(samples*direction > 0):
+            direction = 0
+        arrows.append((a, b, direction))
+        sides.setdefault(a, [None, None])[1] = direction
+        sides.setdefault(b, [None, None])[0] = direction
+    classified = []
+    for x in roots:
+        left, right = sides[x]
+        if 0 in (left, right):
+            kind = "Inconclusive"
+        elif left == 1 and right == -1:
+            kind = "Attracting"
+        elif left == -1 and right == 1:
+            kind = "Repelling"
+        elif left is None or right is None:
+            kind = ("Attracting from within range" if left == 1 or right == -1
+                    else "Repelling from within range")
+        else:
+            kind = "Semistable"
+        classified.append((x, kind))
+    return dict(roots=classified, arrows=arrows, holes=holes, stationary=False)
 
 
 def root_sampler(expression, low, high):

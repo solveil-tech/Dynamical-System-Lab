@@ -17,6 +17,33 @@ def speed_normalization(maximum):
     return FuncNorm((np.log1p, np.expm1), vmin=0, vmax=max(float(maximum), 1e-9), clip=True)
 
 
+def michaelis_menten_qss(times, initial, params):
+    """Evaluate the reduced slow solution on the full solution's time grid."""
+    substrate, complex_fraction = initial
+    # Earlier experiment files used ASCII parameter names.
+    eps, ks, km = (params[name if name in params else legacy]
+                   for name, legacy in (("ε", "eps"), ("κ_s", "ks"), ("κ_m", "km")))
+    if not (substrate >= 0 and 0 <= complex_fraction <= 1 and eps > 0 and 0 <= ks < km):
+        return None
+    if substrate == 0:
+        return np.zeros((len(times), 2))
+    # Invert s + km log(s) = s0 + km log(s0) - (km-ks)t.
+    # Solve for log(s/s0) so the bracket also works near depletion.
+    loss = (1 - ks/km) * np.asarray(times)
+    low, high = -loss, np.zeros_like(loss)
+    with np.errstate(over="ignore"):
+        scale = substrate/km
+    if not np.isfinite(scale):
+        return None
+    for _ in range(54):
+        mid = (low+high)/2
+        residual = mid + scale*np.expm1(mid) + loss
+        low = np.where(residual < 0, mid, low)
+        high = np.where(residual >= 0, mid, high)
+    slow_s = substrate * np.exp((low+high)/2)
+    return np.column_stack((slow_s, slow_s/(slow_s+km)))
+
+
 def trajectory_curve_points(times, points, velocities, spatial_scale, pixel_tolerance=0.10):
     """Refine ODE Hermite dense output at the current display scale.
 

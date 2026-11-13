@@ -282,7 +282,7 @@ def compute_trajectory3d(data):
 def compute_selected_trajectory(data):
     import numpy as np
     import dynamical_system_lab as core
-    from flow_tools import integrate_trajectory
+    from flow_tools import integrate_trajectory, michaelis_menten_qss
 
     def field(point):
         return core._field_vector(data["fields"], point, data["params"])
@@ -291,10 +291,13 @@ def compute_selected_trajectory(data):
         field, data["initial"], data["duration"], data["dt"],
         retain_steps=True, spatial_scale=data["plot_scale"],
     )
-    return {
+    result = {
         "times": times, "points": points, "reason": reason,
         "velocities": np.asarray([field(point) for point in points]),
     }
+    if data.get("compare_qss"):
+        result["qss"] = michaelis_menten_qss(times, data["initial"], data["params"])
+    return result
 
 
 def compute_saddle_manifolds(data):
@@ -349,7 +352,7 @@ def compute_saddle_manifolds(data):
 
 def _serve():
     import dynamical_system_lab  # Warm imports once, without constructing a window.
-    from bifurcation import analyze as analyze_bifurcation, trace as trace_bifurcation
+    from bifurcation import analyze as analyze_bifurcation, phase_line, trace as trace_bifurcation
     sys.stdout.buffer.write(_pack({"ready": True}))
     sys.stdout.buffer.flush()
     for line in sys.stdin.buffer:
@@ -364,6 +367,7 @@ def _serve():
                        "selected_trajectory": compute_selected_trajectory,
                        "saddle_manifolds": compute_saddle_manifolds,
                        "bifurcation": analyze_bifurcation,
+                       "phase_line": phase_line,
                        "bifurcation_trace": trace_bifurcation}[request["kind"]]
             result = handler(request["payload"])
             message = {"id": request["id"], "result": result}

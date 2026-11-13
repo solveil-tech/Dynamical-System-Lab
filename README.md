@@ -33,7 +33,7 @@ buttons and the checkbox rows retain their normal heights; shrinking the window
 restores the original compact inter-group gaps.
 Greek letters restores the previous window height after collapsing an expansion
 that automatically enlarged the window. Params shows only its title when no
-parameters occur in the equations; detected parameters appear three per row,
+parameters occur in the equations; detected parameters appear up to four per row,
 defaulting to 1. Edit their values directly in those fields.
 See [BIFURCATION.md](BIFURCATION.md) for
 the scalar analysis and parameter-sweep controls.

@@ -376,6 +376,8 @@ class EquilibriumInspector(QDialog):
             summary += "\nHyperbolic" if details["hyperbolic"] else "\nNon-hyperbolic"
         if details.get("certified_center"):
             summary += "\nNonlinear center verified by a local integrating factor."
+        if details.get("physical_status"):
+            summary += "\n" + details["physical_status"]
         self.summary.setText(summary)
         available = matrix is not None and np.isfinite(matrix).all()
         self.matrix.setText("\n".join(" ".join(f"{value:>11.5g}" for value in row) for row in matrix)

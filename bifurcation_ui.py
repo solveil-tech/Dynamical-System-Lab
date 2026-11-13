@@ -5,7 +5,8 @@ import numpy as np
 from PySide6.QtCore import QTimer, QSignalBlocker, Qt, QPointF
 from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QGridLayout, QHBoxLayout,
-    QGroupBox, QLabel, QPushButton, QCheckBox, QScrollArea, QFrame, QFileDialog, QSizePolicy, QApplication)
+    QGroupBox, QLabel, QPushButton, QCheckBox, QScrollArea, QFrame, QFileDialog, QSizePolicy,
+    QApplication, QDialog, QDialogButtonBox, QPlainTextEdit)
 from matplotlib.backend_bases import MouseButton
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -13,6 +14,7 @@ from matplotlib.collections import LineCollection
 from background_analysis import AnalysisProcess
 
 
+HILL_SWITCH = "Cell-cycle Hill switch"
 PRESETS = {
     "Saddle-node": "mu-x^2",
     "Transcritical": "mu*x-x^2",
@@ -20,7 +22,73 @@ PRESETS = {
     "Subcritical pitchfork": "mu*x+x^3",
     "Hysteresis (two folds)": "mu+x-x^3",
     "Subcritical with saturation": "mu*x+x^3-x^5",
+    HILL_SWITCH: "-x+(1-x)*(mu+x^4/(x^4+0.3^4))",
 }
+
+
+class PhaseLineDialog(QDialog):
+    def __init__(self, parent, data, dark):
+        super().__init__(parent)
+        self.setWindowTitle("Phase line")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.data = data
+        self.bg, self.fg = ("#000000", "#eeeeee") if dark else ("#ffffff", "#222222")
+        self.stable, self.unstable = ("#80cfff", "#ff7272") if dark else ("#2453a5", "#ca4040")
+        layout = QVBoxLayout(self)
+        self.summary = QLabel(f"Fixed μ = {data['mu']:.8g} · Calculating…")
+        layout.addWidget(self.summary)
+        self.figure = Figure(layout="constrained", facecolor=self.bg)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas, 1)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setFixedHeight(92)
+        layout.addWidget(self.details)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(680, 350)
+        self.worker = AnalysisProcess(self)
+        self.worker.completed.connect(self._complete)
+        self.worker.failed.connect(self._failed)
+        self.finished.connect(lambda _: self.worker.close())
+        self.worker.submit("slice", data, "phase_line")
+
+    def _failed(self, _key, message):
+        self.summary.setText(f"Phase line unavailable at μ = {self.data['mu']:.8g}")
+        self.details.setPlainText(message)
+
+    def _complete(self, _key, result):
+        self.figure.clear()
+        ax = self.figure.add_subplot(facecolor=self.bg)
+        low, high = self.data["bounds"]
+        ax.set(xlim=(low, high), ylim=(-1, 1), yticks=[])
+        ax.axhline(0, linewidth=1, color=self.fg, alpha=.45)
+        ax.set_xlabel("Active fraction x" if self.data["hill"] else "State x", color=self.fg)
+        ax.tick_params(colors=self.fg)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        for a, b, direction in result["arrows"]:
+            if direction:
+                center, half = (a+b)/2, (b-a)*.24*direction
+                ax.annotate("", xy=(center+half, 0), xytext=(center-half, 0),
+                            arrowprops=dict(arrowstyle="->", color=self.fg, linewidth=1.5))
+        rows = []
+        for x, kind in result["roots"]:
+            color = (self.stable if kind.startswith("Attracting") else
+                     self.unstable if kind.startswith("Repelling") else "#df932d")
+            ax.scatter(x, 0, color=color, s=52, zorder=3, clip_on=False)
+            rows.append(f"x ≈ {x:.8g}   ·   {kind}")
+        for x in result["holes"]:
+            ax.scatter(x, 0, color=self.fg, marker="x", zorder=4, clip_on=False)
+            rows.append(f"x ≈ {x:.8g}   ·   Undefined")
+        if result["stationary"]:
+            rows.insert(0, "Every defined state on this slice is stationary.")
+        elif not result["roots"]:
+            rows.insert(0, "No isolated equilibrium detected in this interval.")
+        self.summary.setText(f"Fixed μ = {self.data['mu']:.8g} · Arrows show the direction of motion")
+        self.details.setPlainText("\n".join(rows))
+        self.canvas.draw_idle()
 
 
 def continuous_paths(segments):
@@ -149,6 +217,7 @@ class BifurcationPanel(QWidget):
         self._press = None
         self._dragging = False
         self._drawing = False
+        self._phase_line_mu = None
         self.view_debounce = QTimer(self)
         self.view_debounce.setSingleShot(True)
         self.view_debounce.setInterval(300)
@@ -239,6 +308,10 @@ class BifurcationPanel(QWidget):
         self.show_derivative.toggled.connect(lambda _: self.draw())
         row.addWidget(self.show_derivative)
         row.addStretch()
+        phase_line_button = QPushButton("Phase line…")
+        phase_line_button.setToolTip("Inspect μ₀, or right-click the diagram to inspect a different μ.")
+        phase_line_button.clicked.connect(lambda: self._open_phase_line(self.mu0.value()))
+        row.addWidget(phase_line_button)
         for label, callback in (("+", lambda: self.zoom(.8)), ("−", lambda: self.zoom(1.25)),
                                 ("Reset view", self.reset_view), ("Export PNG…", self.export_png)):
             button = QPushButton(label)
@@ -302,8 +375,33 @@ class BifurcationPanel(QWidget):
 
     def _preset(self, name):
         self.preset.setToolTip(name)
+        if name == HILL_SWITCH:
+            for spin, value in zip((*self.bounds, self.mu0, self.x0), (0, .2, 0, 1, 0, 0)):
+                with QSignalBlocker(spin):
+                    spin.setValue(value)
+            self._home_bounds = (0, .2, 0, 1)
         if name in PRESETS:
-            self.formula.setText(PRESETS[name])
+            formula = self.formatter(re.sub(r"\bmu\b", "μ", PRESETS[name]), {"μ"})
+            if formula != self.formula.text():
+                self.formula.setText(formula)
+                return
+        self._changed()
+
+    def _open_phase_line(self, mu):
+        hill = self.preset.currentText() == HILL_SWITCH
+        if not np.isfinite(mu) or (hill and mu < 0):
+            self.status.setText("Choose a finite, nonnegative signal for the Hill switch.")
+            return
+        bounds = (0, 1) if hill else self.ax.get_ylim()
+        dialog = PhaseLineDialog(self, dict(formula=self.formula.text(), mu=mu, bounds=bounds, hill=hill), self.dark)
+        self._phase_line_mu = mu
+        self.draw()
+        dialog.finished.connect(self._close_phase_line)
+        dialog.open()
+
+    def _close_phase_line(self, _result):
+        self._phase_line_mu = None
+        self.draw()
 
     def _formula_changed(self, _text):
         text = re.sub(r"\bmu\b", "μ", self.formula.text())
@@ -343,6 +441,11 @@ class BifurcationPanel(QWidget):
         bounds = tuple(spin.value() for spin in self.bounds)
         if bounds[0] >= bounds[1] or bounds[2] >= bounds[3]:
             raise ValueError("Each minimum must be smaller than its maximum.")
+        if self.preset.currentText() == HILL_SWITCH:
+            m0, m1, x0, x1 = bounds
+            bounds = (max(0, m0), m1, max(0, x0), min(1, x1))
+            if bounds[0] >= bounds[1] or bounds[2] >= bounds[3]:
+                raise ValueError("Include part of the physical range μ ≥ 0, 0 ≤ x ≤ 1.")
         return dict(formula=self.formula.text(), bounds=bounds)
 
     def analyze(self, *_args):
@@ -444,7 +547,11 @@ class BifurcationPanel(QWidget):
         if self.result is None:
             self.status.setText("Wait for the current formula to finish analysis before tracing.")
             return
-        data = self.configuration()
+        try:
+            data = self.configuration()
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return
         initial = (self.mu0.value(), self.x0.value())
         m0, m1, x0, x1 = data["bounds"]
         if not (m0 <= initial[0] <= m1 and x0 <= initial[1] <= x1):
@@ -475,6 +582,8 @@ class BifurcationPanel(QWidget):
             self.info.set_rows(["Enter a scalar system and select the analysis window."], self.fg)
             return
         rows, bold_phrases = [], []
+        if self.preset.currentText() == HILL_SWITCH:
+            rows.append("Physical range: signal μ ≥ 0 and active fraction 0 ≤ x ≤ 1.")
         m0, m1, x0, x1 = (spin.value() for spin in self.bounds)
         for p in self.result["critical"]:
             if not (m0 <= p["mu"] <= m1 and x0 <= p["x"] <= x1):
@@ -551,10 +660,17 @@ class BifurcationPanel(QWidget):
         self.ax.tick_params(colors=fg, labelsize=9)
         for spine in self.ax.spines.values():
             spine.set_color("#555555" if self.dark else "#cccccc")
-        self.ax.set_xlabel("μ", color=fg)
-        self.ax.set_ylabel("x", color=fg)
+        hill = self.preset.currentText() == HILL_SWITCH
+        self.ax.set_xlabel("Signal μ" if hill else "μ", color=fg)
+        self.ax.set_ylabel("Active fraction x" if hill else "x", color=fg)
         self.ax.set_title("BIFURCATION DIAGRAM", color=fg, fontsize=11, fontweight="bold")
         self.ax.grid(alpha=.1, color=fg)
+        if hill:
+            for boundary in (0, 1):
+                self.ax.axhline(boundary, color=fg, linestyle=":", linewidth=1, alpha=.35)
+            self.ax.axvline(0, color=fg, linestyle=":", linewidth=1, alpha=.35)
+        if self._phase_line_mu is not None:
+            self.ax.axvline(self._phase_line_mu, color=fg, linestyle="--", linewidth=1, alpha=.55)
         if self.result:
             segments, kind = self.result["segments"], self.result["stability"]
             for code, color, style in ((-1, "#80cfff" if self.dark else "#2453a5", "solid"),
@@ -642,6 +758,9 @@ class BifurcationPanel(QWidget):
         return dragged
 
     def _mouse_up(self, event):
+        if event.button == MouseButton.RIGHT and event.inaxes is self.ax and self._press is None:
+            self._open_phase_line(event.xdata)
+            return
         if self._press is None or event.button != MouseButton.LEFT:
             return
         self._mouse_move(event)
