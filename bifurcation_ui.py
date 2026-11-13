@@ -15,6 +15,7 @@ from background_analysis import AnalysisProcess
 
 
 HILL_SWITCH = "Cell-cycle Hill switch"
+BUDWORM = "Budworm (R = μ, B = 10)"
 PRESETS = {
     "Saddle-node": "mu-x^2",
     "Transcritical": "mu*x-x^2",
@@ -23,6 +24,7 @@ PRESETS = {
     "Hysteresis (two folds)": "mu+x-x^3",
     "Subcritical with saturation": "mu*x+x^3-x^5",
     HILL_SWITCH: "-x+(1-x)*(mu+x^4/(x^4+0.3^4))",
+    BUDWORM: "mu*x*(1-x/10)-x^2/(1+x^2)",
 }
 
 
@@ -380,6 +382,11 @@ class BifurcationPanel(QWidget):
                 with QSignalBlocker(spin):
                     spin.setValue(value)
             self._home_bounds = (0, .2, 0, 1)
+        elif name == BUDWORM:
+            for spin, value in zip((*self.bounds, self.mu0, self.x0), (.1, .8, 0, 10.5, .3, .4)):
+                with QSignalBlocker(spin):
+                    spin.setValue(value)
+            self._home_bounds = (.1, .8, 0, 10.5)
         if name in PRESETS:
             formula = self.formatter(re.sub(r"\bmu\b", "μ", PRESETS[name]), {"μ"})
             if formula != self.formula.text():
@@ -588,7 +595,8 @@ class BifurcationPanel(QWidget):
         for p in self.result["critical"]:
             if not (m0 <= p["mu"] <= m1 and x0 <= p["x"] <= x1):
                 continue
-            rows.append(f"$(\\mu,x)=({p['mu_text']},{p['x_text']})$    {p['kind']}    {p['stability']} at the critical parameter")
+            relation = r"\approx" if p.get("approximate") else "="
+            rows.append(f"$(\\mu,x){relation}({p['mu_text']},{p['x_text']})$    {p['kind']}    {p['stability']} at the critical parameter")
             bold_phrases.extend((p["kind"], p["stability"]))
         rows += self.result["notes"]
         if self.trace_result:

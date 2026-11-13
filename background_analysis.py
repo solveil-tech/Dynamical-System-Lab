@@ -353,6 +353,7 @@ def compute_saddle_manifolds(data):
 def _serve():
     import dynamical_system_lab  # Warm imports once, without constructing a window.
     from bifurcation import analyze as analyze_bifurcation, phase_line, trace as trace_bifurcation
+    from travelling_waves import analyze as analyze_travelling_wave
     sys.stdout.buffer.write(_pack({"ready": True}))
     sys.stdout.buffer.flush()
     for line in sys.stdin.buffer:
@@ -368,6 +369,7 @@ def _serve():
                        "saddle_manifolds": compute_saddle_manifolds,
                        "bifurcation": analyze_bifurcation,
                        "phase_line": phase_line,
+                       "travelling_wave": analyze_travelling_wave,
                        "bifurcation_trace": trace_bifurcation}[request["kind"]]
             result = handler(request["payload"])
             message = {"id": request["id"], "result": result}

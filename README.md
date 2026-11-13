@@ -40,3 +40,14 @@ the scalar analysis and parameter-sweep controls.
 
 New experiment files use the Dynamical System Lab name. Experiment files saved
 by earlier ODE Flow Lab versions remain supported.
+
+Travelling-wave analysis is available in Others settings and files, and beside
+Trace Fisher front in the Fisher model's Flow page. Enter a smooth reaction
+f(u), diffusion D > 0 and trial speed v; other parameters are detected automatically.
+The tool shows the transformed phase plane, detected equilibria, signed reaction
+areas between selected left/right states, and the minimum admissible Fisher
+speed when the reaction is logistic. Use in Flow exports x = u, y = w; the ODE
+independent variable then represents the travelling coordinate ξ. Analysis runs
+in a cancellable worker. Area-based propagation direction assumes a connecting
+front exists; it does not solve the boundary-value problem or determine its speed.
+The Budworm bifurcation preset varies R = μ with fixed B = 10.

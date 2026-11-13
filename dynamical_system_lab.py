@@ -4170,8 +4170,12 @@ class DynamicalSystemLab(QMainWindow):
         self.front_btn = QPushButton("Trace Fisher front")
         self.front_btn.setToolTip("Start just off (u,w) = (1,0) along the descending unstable branch.")
         self.front_btn.clicked.connect(self._trace_fisher_front)
-        form.addWidget(self.front_btn, 2, 0, 1, 6)
+        form.addWidget(self.front_btn, 2, 0, 1, 3)
         self.front_btn.hide()
+        self.front_analysis_btn = QPushButton("Travelling-wave analysis…")
+        self.front_analysis_btn.clicked.connect(self._open_travelling_waves)
+        form.addWidget(self.front_analysis_btn, 2, 3, 1, 3)
+        self.front_analysis_btn.hide()
         layout.addWidget(self.initial_box)
         self.solution_status = QLabel("Click the 2D phase plot or enter an initial point, then Trace solution.\nPlayback and direction normalization do not change this solution.")
         self.solution_status.setWordWrap(True)
@@ -4205,6 +4209,16 @@ class DynamicalSystemLab(QMainWindow):
         self.color_max.valueChanged.connect(self._on_color_range_changed)
         content_layout.addWidget(colors)
 
+        waves = QGroupBox("Travelling waves")
+        wave_layout = QVBoxLayout(waves)
+        self.wave_tools_btn = QPushButton("Travelling-wave analysis…")
+        self.wave_tools_btn.clicked.connect(self._open_travelling_waves)
+        wave_layout.addWidget(self.wave_tools_btn)
+        wave_note = QLabel("Reaction functions, Fisher wave speeds and propagation direction.")
+        wave_note.setWordWrap(True)
+        wave_layout.addWidget(wave_note)
+        content_layout.addWidget(waves)
+
         files = QGroupBox("Save and export")
         buttons = QGridLayout(files)
         actions = (("Save experiment…", self.save_experiment), ("Load experiment…", self.load_experiment),
@@ -4222,6 +4236,42 @@ class DynamicalSystemLab(QMainWindow):
         scroll.setWidget(content)
         layout.addWidget(scroll)
         self.right_tabs.addTab(page, "Others settings and files")
+
+    def _open_travelling_waves(self):
+        from travelling_waves_ui import TravellingWaveDialog
+        if getattr(self, "_wave_dialog", None) is not None:
+            self._wave_dialog.raise_()
+            self._wave_dialog.activateWindow()
+            return
+        self._wave_dialog = TravellingWaveDialog(self)
+        self._wave_dialog.finished.connect(lambda _result: setattr(self, "_wave_dialog", None))
+        self._wave_dialog.show()
+
+    def _load_travelling_wave(self, result, diffusion, speed):
+        self.stop_animation()
+        self.mode_tabs.setCurrentIndex(0)
+        self.dimension_selector.setCurrentText("2D")
+        self.coordinate_selector.setCurrentText("Cartesian")
+        self.model_selector.setCurrentText("Custom")
+        params = dict(result["params"], D=diffusion, v=speed)
+        self._updating_model_inputs = True
+        try:
+            self.param_input.setText(", ".join(
+                f"{display_parameter_name(name)}={value:.17g}" for name, value in params.items()))
+            for editor, text in zip((self.fx_input, self.fy_input), result["fields"]):
+                editor.setText(format_formula_input(text, params))
+            self._custom_model_states["2D"] = (
+                self.fx_input.text(), self.fy_input.text(), "", self.param_input.text())
+            self._mode_states["2D"] = self._read_editor_state()
+        finally:
+            self._updating_model_inputs = False
+        self._auto_apply_timer.stop()
+        self.first_quadrant.setChecked(False)
+        scale = result["w_scale"]
+        self._set_view_bounds((result["u"][0], result["u"][-1], -scale, scale))
+        self.right_tabs.setCurrentIndex(0)
+        self.apply_model()
+        self.status.setText("Travelling-wave phase portrait ready. x = u, y = w; equation time represents ξ.")
 
     def _solution_signature(self):
         fields = (self.fx, self.fy) if self._dimension == "2D" else (self.fx, self.fy, self.fz)
@@ -4355,6 +4405,7 @@ class DynamicalSystemLab(QMainWindow):
         preset = self._flow_biology_preset()
         fisher = preset == FISHER_FRONT
         self.front_btn.setVisible(fisher)
+        self.front_analysis_btn.setVisible(fisher)
         self.initial_box.setTitle({
             FISHER_FRONT: "Initial-value solution in travelling coordinate ξ",
             MICHAELIS_MENTEN: "Full system and quasi-steady approximation (slow time τ)",
@@ -5875,6 +5926,8 @@ class DynamicalSystemLab(QMainWindow):
             self.toggle_animation()
 
     def closeEvent(self, event):
+        if getattr(self, "_wave_dialog", None) is not None:
+            self._wave_dialog.close()
         self.bifurcation_panel.close_workers()
         self._solution_process.close()
         self._phase_resize_timer.stop()

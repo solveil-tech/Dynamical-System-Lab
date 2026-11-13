@@ -98,13 +98,17 @@ def real_point(values, bounds, expression, derivative, guards):
         if not (x0-1e-9 <= x <= x1+1e-9 and m0-1e-9 <= mu <= m1+1e-9):
             return None
         point = {X: xx, MU: mm}
-        if any(sp.simplify(g.subs(point)).is_zero is not False for g in guards):
+        if any(g.is_zero is not False and sp.simplify(g.subs(point)).is_zero is not False
+               for g in guards):
             return None
         for f in (expression, derivative):
             value = complex(f.subs(point).evalf())
             if not np.isfinite(value) or abs(value) > 1e-7:
                 return None
-        return xx, mm
+        # Keep exact real algebraic roots. A remaining complex radical whose
+        # imaginary part is only roundoff is displayed as a numerical candidate.
+        return (xx if xx.is_real is True else sp.Float(x),
+                mm if mm.is_real is True else sp.Float(mu))
     except (ValueError, TypeError, OverflowError):
         return None
 
@@ -214,8 +218,28 @@ def analyze(data):
             notes.append("Non-isolated nonhyperbolic set present; f = fₓ = 0 alone does not certify a bifurcation.")
         else:
             try:
-                solutions = sp.solve_poly_system([numerator, dn], X, MU, strict=True)
-                candidates = solutions or []
+                parameter_poly = sp.Poly(numerator, MU)
+                a = b = fold = None
+                low_degree_factors = False
+                if parameter_poly.degree() == 1:
+                    a, b = parameter_poly.all_coeffs()
+                    fold = sp.expand(sp.diff(b, X)*a-b*sp.diff(a, X))
+                    low_degree_factors = all(sp.degree(factor, X) <= 3
+                                             for factor, _power in sp.factor_list(fold, X)[1])
+                if low_degree_factors:
+                    # Real root isolation avoids complex radical representations
+                    # of real folds (notably the budworm's cubic fold equation).
+                    for root in sp.real_roots(fold, X, radicals=False):
+                        av, bv = sp.simplify(a.subs(X, root)), sp.simplify(b.subs(X, root))
+                        if av != 0:
+                            candidates.append((root, -bv/av))
+                        elif bv == 0:
+                            da = sp.simplify(sp.diff(a, X).subs(X, root))
+                            if da != 0:
+                                candidates.append((root, -sp.diff(b, X).subs(X, root)/da))
+                else:
+                    solutions = sp.solve_poly_system([numerator, dn], X, MU, strict=True)
+                    candidates = solutions or []
                 exact = True
             except (NotImplementedError, sp.PolynomialError, UnsolvableFactorError):
                 candidates = numerical_critical_points(expression, derivative, bounds)
@@ -238,11 +262,14 @@ def analyze(data):
         if any(np.linalg.norm(number-p) < 1e-8 for p in seen):
             continue
         seen.append(number)
-        certified = (sp.simplify(expression.subs({X: xx, MU: mm})) == 0
+        certified = (not xx.has(sp.Float) and not mm.has(sp.Float)
+                     and sp.simplify(expression.subs({X: xx, MU: mm})) == 0
                      and sp.simplify(derivative.subs({X: xx, MU: mm})) == 0)
+        approximate = xx.has(sp.Float, sp.CRootOf) or mm.has(sp.Float, sp.CRootOf)
         critical.append(dict(mu=float(mm), x=float(xx),
-                             mu_text=sp.latex(mm) if not mm.has(sp.Float) else pretty(mm),
-                             x_text=sp.latex(xx) if not xx.has(sp.Float) else pretty(xx),
+                             mu_text=pretty(mm) if approximate else sp.latex(mm),
+                             x_text=pretty(xx) if approximate else sp.latex(xx),
+                             approximate=approximate,
                              kind=classify(expression, xx, mm, factors) if certified else "Numerical nonhyperbolic candidate (type unconfirmed)",
                              stability=stability(expression, {X: xx, MU: mm}) if certified
                              else "Inconclusive at a numerical critical point"))
