@@ -6,7 +6,7 @@ from PySide6.QtCore import QTimer, QSignalBlocker, Qt, QPointF
 from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QGridLayout, QHBoxLayout,
     QGroupBox, QLabel, QPushButton, QCheckBox, QScrollArea, QFrame, QFileDialog, QSizePolicy,
-    QApplication, QDialog, QDialogButtonBox, QPlainTextEdit)
+    QApplication, QDialog, QDialogButtonBox, QPlainTextEdit, QMenu, QSlider)
 from matplotlib.backend_bases import MouseButton
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -220,6 +220,7 @@ class BifurcationPanel(QWidget):
         self._dragging = False
         self._drawing = False
         self._phase_line_mu = None
+        self.imperfection = 0.0
         self.view_debounce = QTimer(self)
         self.view_debounce.setSingleShot(True)
         self.view_debounce.setInterval(300)
@@ -310,6 +311,12 @@ class BifurcationPanel(QWidget):
         self.show_derivative.toggled.connect(lambda _: self.draw())
         row.addWidget(self.show_derivative)
         row.addStretch()
+        self.course_button = QPushButton("Experiments")
+        course_menu = QMenu(self.course_button)
+        self.imperfection_action = course_menu.addAction("Imperfection δ…", self._open_imperfection)
+        course_menu.addAction("Planar Hopf…", self._open_hopf)
+        self.course_button.setMenu(course_menu)
+        row.addWidget(self.course_button)
         phase_line_button = QPushButton("Phase line…")
         phase_line_button.setToolTip("Inspect μ₀, or right-click the diagram to inspect a different μ.")
         phase_line_button.clicked.connect(lambda: self._open_phase_line(self.mu0.value()))
@@ -400,7 +407,7 @@ class BifurcationPanel(QWidget):
             self.status.setText("Choose a finite, nonnegative signal for the Hill switch.")
             return
         bounds = (0, 1) if hill else self.ax.get_ylim()
-        dialog = PhaseLineDialog(self, dict(formula=self.formula.text(), mu=mu, bounds=bounds, hill=hill), self.dark)
+        dialog = PhaseLineDialog(self, dict(formula=self._active_formula(), mu=mu, bounds=bounds, hill=hill), self.dark)
         self._phase_line_mu = mu
         self.draw()
         dialog.finished.connect(self._close_phase_line)
@@ -409,6 +416,54 @@ class BifurcationPanel(QWidget):
     def _close_phase_line(self, _result):
         self._phase_line_mu = None
         self.draw()
+
+    def _open_imperfection(self):
+        if getattr(self, "_imperfection_dialog", None) is not None:
+            self._imperfection_dialog.raise_()
+            self._imperfection_dialog.activateWindow()
+            return
+        dialog = QDialog(self)
+        self._imperfection_dialog = dialog
+        dialog.finished.connect(lambda _result: setattr(self, "_imperfection_dialog", None))
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.setWindowTitle("Imperfect bifurcation")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("dx/dt = f(x, μ) + δ"))
+        row = QHBoxLayout()
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-1000, 1000)
+        slider.setValue(round(1000*self.imperfection))
+        value = self.host.make_spin(self.imperfection, -10, 10, .01)
+        value.setToolTip("Type a value or drag the slider over −1 ≤ δ ≤ 1.")
+        row.addWidget(slider, 1)
+        row.addWidget(value)
+        layout.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        reset = buttons.addButton("Set δ = 0", QDialogButtonBox.ButtonRole.ResetRole)
+        reset.clicked.connect(lambda: value.setValue(0))
+        layout.addWidget(buttons)
+
+        def change(delta):
+            with QSignalBlocker(slider):
+                slider.setValue(round(1000*delta))
+            self.imperfection = delta
+            self.imperfection_action.setText(f"Imperfection δ = {delta:g}…" if delta else "Imperfection δ…")
+            self.course_button.setText("Experiments (δ)" if delta else "Experiments")
+            self._changed()
+
+        slider.valueChanged.connect(lambda step: value.setValue(step/1000))
+        value.valueChanged.connect(change)
+        dialog.resize(350, 130)
+        dialog.show()
+
+    def _open_hopf(self):
+        from course_tools_ui import HopfDialog
+        HopfDialog(self.host).open()
+
+    def _active_formula(self):
+        source = self.formula.text()
+        return f"({source})+({self.imperfection:.3f})" if self.imperfection else source
 
     def _formula_changed(self, _text):
         text = re.sub(r"\bmu\b", "μ", self.formula.text())
@@ -453,7 +508,7 @@ class BifurcationPanel(QWidget):
             bounds = (max(0, m0), m1, max(0, x0), min(1, x1))
             if bounds[0] >= bounds[1] or bounds[2] >= bounds[3]:
                 raise ValueError("Include part of the physical range μ ≥ 0, 0 ≤ x ≤ 1.")
-        return dict(formula=self.formula.text(), bounds=bounds)
+        return dict(formula=self._active_formula(), bounds=bounds)
 
     def analyze(self, *_args):
         self.debounce.stop()

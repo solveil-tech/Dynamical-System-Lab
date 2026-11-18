@@ -301,6 +301,7 @@ def compute_selected_trajectory(data):
 
 
 def compute_saddle_manifolds(data):
+    from planar_tools import saddle_series
     import math
     import numpy as np
     import dynamical_system_lab as core
@@ -347,13 +348,14 @@ def compute_saddle_manifolds(data):
     speed = np.hypot(u, v)
     valid = np.isfinite(speed) & (speed > 0)
     arrows = (x[valid], y[valid], u[valid] / speed[valid], v[valid] / speed[valid])
-    return paths, incomplete, arrows
+    return paths, incomplete, arrows, saddle_series(fields, params, point, data["directions"])
 
 
 def _serve():
     import dynamical_system_lab  # Warm imports once, without constructing a window.
     from bifurcation import analyze as analyze_bifurcation, phase_line, trace as trace_bifurcation
     from travelling_waves import analyze as analyze_travelling_wave
+    from planar_tools import hopf_scan, linear_comparison, planar_criteria
     sys.stdout.buffer.write(_pack({"ready": True}))
     sys.stdout.buffer.flush()
     for line in sys.stdin.buffer:
@@ -370,6 +372,9 @@ def _serve():
                        "bifurcation": analyze_bifurcation,
                        "phase_line": phase_line,
                        "travelling_wave": analyze_travelling_wave,
+                       "planar_criteria": planar_criteria,
+                       "linear_comparison": linear_comparison,
+                       "hopf_scan": hopf_scan,
                        "bifurcation_trace": trace_bifurcation}[request["kind"]]
             result = handler(request["payload"])
             message = {"id": request["id"], "result": result}

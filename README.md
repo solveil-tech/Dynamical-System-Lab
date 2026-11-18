@@ -51,3 +51,16 @@ independent variable then represents the travelling coordinate ξ. Analysis runs
 in a cancellable worker. Area-based propagation direction assumes a connecting
 front exists; it does not solve the boundary-value problem or determine its speed.
 The Budworm bifurcation preset varies R = μ with fixed B = 10.
+
+**Planar criteria** in Phase portrait checks the displayed rectangle or a
+region selected on the divergence map. It reports Bendixson–Dulac and curl
+tests separately from a sampled estimate of the boundary's Poincaré index.
+The equilibrium inspector can compare linearised and nonlinear trajectories
+from the same perturbation, and overlays quadratic approximations in its saddle
+manifold view. **Scan for Hopf** follows the selected equilibrium of a planar
+polynomial system while varying a parameter. The eigenvalues are sampled and the
+reported amplitude curves are local normal-form approximations.
+
+In Bifurcation, **Experiments** opens either an additive perturbation δ of the
+scalar equation or the planar cubic Hopf normal form. The scalar perturbation
+applies to the diagram, phase line and parameter sweep together.

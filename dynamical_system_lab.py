@@ -4005,6 +4005,11 @@ class DynamicalSystemLab(QMainWindow):
         phase_tools = QHBoxLayout()
         phase_tools.setContentsMargins(PHASE_TOOLS_INSET, 0, PHASE_TOOLS_INSET, 0)
         phase_tools.addWidget(self.speed_color)
+        self.planar_criteria_btn = QPushButton("Planar criteria…")
+        self.planar_criteria_btn.setFixedHeight(26)
+        self.planar_criteria_btn.clicked.connect(self._open_planar_criteria)
+        self._two_d_only_widgets.append(self.planar_criteria_btn)
+        phase_tools.addWidget(self.planar_criteria_btn)
         phase_tools.addStretch(1)
         phase_tools.addWidget(self.phase_zoom_controls)
         phase_layout.addLayout(phase_tools)
@@ -4246,6 +4251,19 @@ class DynamicalSystemLab(QMainWindow):
         self._wave_dialog = TravellingWaveDialog(self)
         self._wave_dialog.finished.connect(lambda _result: setattr(self, "_wave_dialog", None))
         self._wave_dialog.show()
+
+    def _open_planar_criteria(self):
+        if self._dimension != "2D":
+            return
+        if self._auto_apply_timer.isActive():
+            self._auto_apply_timer.stop()
+            self.apply_model()
+        if not self._last_apply_valid:
+            self.status.setText("Enter a valid planar system to analyse it.")
+            return
+        from course_tools_ui import PlanarCriteriaDialog
+        dialog = PlanarCriteriaDialog(self, (self.fx, self.fy), dict(self.params), self._active_bounds)
+        dialog.open()
 
     def _load_travelling_wave(self, result, diffusion, speed):
         self.stop_animation()
@@ -5447,7 +5465,7 @@ class DynamicalSystemLab(QMainWindow):
             # behavior; all other right-side clicks outside the axes dismiss.
             on_zoom = (watched is self.phase_zoom_controls
                        or self.phase_zoom_controls.isAncestorOf(watched)
-                       or watched is self.speed_color)
+                       or watched in (self.speed_color, self.planar_criteria_btn))
             if not on_controls and not on_plot and not on_tab_bar and not on_zoom and watched is not self.show_selected:
                 self._dismiss_selected_trace()
         if event.type() == QEvent.Type.FocusIn and watched in (self.fx_input, self.fy_input, self.fz_input):

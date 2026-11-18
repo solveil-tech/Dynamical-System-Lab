@@ -269,6 +269,13 @@ class EquilibriumInspector(QDialog):
             analysis.addStretch(1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        if self.two_d:
+            self.compare_button = buttons.addButton("Compare linearisation…", QDialogButtonBox.ButtonRole.ActionRole)
+            self.compare_button.setEnabled(False)
+            self.compare_button.clicked.connect(self._compare_linearisation)
+            self.hopf_button = buttons.addButton("Scan for Hopf…", QDialogButtonBox.ButtonRole.ActionRole)
+            self.hopf_button.setEnabled(False)
+            self.hopf_button.clicked.connect(self._scan_hopf)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         width, height = (850, 590) if self.two_d else (740, 470)
@@ -379,7 +386,7 @@ class EquilibriumInspector(QDialog):
         if details.get("physical_status"):
             summary += "\n" + details["physical_status"]
         self.summary.setText(summary)
-        available = matrix is not None and np.isfinite(matrix).all()
+        available = matrix is not None and bool(np.isfinite(matrix).all())
         self.matrix.setText("\n".join(" ".join(f"{value:>11.5g}" for value in row) for row in matrix)
                             if available else "Unavailable")
         self.spectrum.setText(details["eigenvalues"])
@@ -389,6 +396,8 @@ class EquilibriumInspector(QDialog):
             for value, direction in directions
         ) or ("No real eigendirections" if available else "Unavailable"))
         if self.two_d:
+            self.compare_button.setEnabled(available)
+            self.hopf_button.setEnabled(available and bool(self.params))
             if self.pending_manifold is not None and self.pending_manifold != index:
                 self.worker.cancel()
                 self.pending_manifold = None
@@ -443,6 +452,18 @@ class EquilibriumInspector(QDialog):
             ax.set_title("Linear type  ·  Δ = (tr J)² − 4 det J", color=self.foreground, fontsize=10)
         self.trace_canvas.draw_idle()
 
+    def _compare_linearisation(self):
+        from course_tools_ui import LinearComparisonDialog
+        point, details = self.results[self.selected_index]
+        dialog = LinearComparisonDialog(self.parentWidget(), self, self.fields, self.params,
+                                        point, details["jacobian"], self.radius)
+        dialog.open()
+
+    def _scan_hopf(self):
+        from course_tools_ui import HopfScanDialog
+        point, _details = self.results[self.selected_index]
+        HopfScanDialog(self.parentWidget(), self, self.fields, self.params, point, self.radius).open()
+
     def _show_manifolds(self, tab):
         if tab != 1 or not self.plots.isTabEnabled(1):
             return
@@ -470,7 +491,7 @@ class EquilibriumInspector(QDialog):
             self.pending_manifold = None
             self.saddle_status.setText(f"Manifold analysis incomplete. {message}")
 
-    def _draw_manifolds(self, index, paths, incomplete, arrows=None):
+    def _draw_manifolds(self, index, paths, incomplete, arrows=None, series=()):
         ax = self._axes(self.saddle_canvas)
         point, details = self.results[index]
         if arrows is not None and len(arrows[0]):
@@ -484,6 +505,13 @@ class EquilibriumInspector(QDialog):
             for is_stable, path in paths:
                 if is_stable == stable:
                     ax.plot(*path.T, color=color, linewidth=1.8)
+        coefficients = []
+        for stable, axis, transverse, coefficient in series:
+            s = np.linspace(-.65*self.radius, .65*self.radius, 151)
+            approximation = point + s[:, None]*axis + (coefficient*s*s)[:, None]*transverse
+            color = self.stable_color if stable else self.unstable_color
+            ax.plot(*approximation.T, ":", color=color, linewidth=2, zorder=4)
+            coefficients.append(f"{'stable' if stable else 'unstable'}: q ≈ {coefficient:.5g}")
         ax.scatter(*point, color=self.foreground, s=23, zorder=5)
         ax.set(xlim=point[0] + np.array([-self.radius, self.radius]),
                ylim=point[1] + np.array([-self.radius, self.radius]), aspect="equal")
@@ -492,6 +520,8 @@ class EquilibriumInspector(QDialog):
         ax.set_ylabel("y", color=self.foreground)
         ax.set_title("Stable (blue) and unstable (red)", color=self.foreground, fontsize=10)
         message = "Dashed lines are eigenvector tangents. Solid lines are numerical local branches."
+        if coefficients:
+            message += "\nDotted: quadratic approximation in each eigenbasis (transverse coordinate = q·s²). " + ", ".join(coefficients)
         if incomplete:
             message += f" {incomplete} of 4 branches stopped early."
         self.saddle_status.setText(message)
